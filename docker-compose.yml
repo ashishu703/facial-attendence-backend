@@ -1,34 +1,139 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  gateway:
-    build: ./ # Maan rahe hain main service root mein hai
-    container_name: api_gateway
+  # PostgreSQL Database Service
+  postgres:
+    image: postgres:15-alpine
+    container_name: attendance-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-anocab_db}
+      POSTGRES_USER: ${DB_USER:-anocabuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-AnoCab@12345}
     ports:
-      - "5010:5010"
-    env_file:
-      - ./.env
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - attendance-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-anocabuser}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  mark_service:
-    build: ./mark-service # Apne mark service ke folder ka path dein
-    container_name: mark_service
+  # Main Service (Aapka Port 5010)
+  main-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendance-main-service
+    command: ["node", "server.js"]
     ports:
-      - "5020:5020"
+      - "${PORT:-5010}:5010"
     env_file:
-      - ./.env
+      - ./.env # <- THEEK KIYA GAYA
+    environment:
+      - PORT=${PORT:-5010}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - NODE_ENV=${NODE_ENV:-production}
+    volumes:
+      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
+      - ./models:/app/models # <- THEEK KIYA GAYA
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - attendance-net
+    restart: unless-stopped
 
-  verify_service:
-    build: ./verify-service # Apne verify service ke folder ka path dein
-    container_name: verify_service
+  # Mark Service (Aapka Port 5020)
+  mark-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendance-mark-service
+    command: ["node", "server.mark.js"]
     ports:
-      - "5030:5030"
+      - "${MARK_SERVICE_PORT:-5020}:5020"
     env_file:
-      - ./.env
+      - ./.env # <- THEEK KIYA GAYA
+    environment:
+      - PORT=${MARK_SERVICE_PORT:-5020}
+      - MARK_SERVICE_PORT=${MARK_SERVICE_PORT:-5020}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - NODE_ENV=${NODE_ENV:-production}
+    volumes:
+      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
+      - ./models:/app/models # <- THEEK KIYA GAYA
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - attendance-net
+    restart: unless-stopped
 
-  register_service:
-    build: ./register-service # Apne register service ke folder ka path dein
-    container_name: register_service
+  # Verify Service (Aapka Port 5030)
+  verify-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendance-verify-service
+    command: ["node", "server.verify.js"]
     ports:
-      - "5040:5040"
+      - "${VERIFY_SERVICE_PORT:-5030}:5030"
     env_file:
-      - ./.env
+      - ./.env # <- THEEK KIYA GAYA
+    environment:
+      - PORT=${VERIFY_SERVICE_PORT:-5030}
+      - VERIFY_SERVICE_PORT=${VERIFY_SERVICE_PORT:-5030}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - NODE_ENV=${NODE_ENV:-production}
+    volumes:
+      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
+      - ./models:/app/models # <- THEEK KIYA GAYA
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - attendance-net
+    restart: unless-stopped
+
+  # Register Service (Aapka Port 5040)
+  register-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendance-register-service
+    command: ["node", "server.register.js"]
+    ports:
+      - "${REGISTER_SERVICE_PORT:-5040}:5040"
+    env_file:
+      - ./.env # <- THEEK KIYA GAYA
+    environment:
+      - PORT=${REGISTER_SERVICE_PORT:-5040}
+      - REGISTER_SERVICE_PORT=${REGISTER_SERVICE_PORT:-5040}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - NODE_ENV=${NODE_ENV:-production}
+    volumes:
+      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
+      - ./models:/app/models # <- THEEK KIYA GAYA
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - attendance-net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  attendance-net:
+    name: attendance-net
+    driver: bridge

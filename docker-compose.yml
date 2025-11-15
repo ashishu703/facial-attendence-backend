@@ -10,7 +10,8 @@ services:
       POSTGRES_USER: ${DB_USER:-anocabuser}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-AnoCab@12345}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      # [FIX] Host port ko 5432 se 5434 kar diya taaki conflict na ho
+      - "${DB_PORT:-5434}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -32,15 +33,15 @@ services:
     ports:
       - "${PORT:-5010}:5010"
     env_file:
-      - ./.env # <- THEEK KIYA GAYA
+      - ./.env
     environment:
       - PORT=${PORT:-5010}
       - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_PORT=5432 # <- Yeh 5432 hi rahega, kyunki yeh internal network port hai
       - NODE_ENV=${NODE_ENV:-production}
     volumes:
-      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
-      - ./models:/app/models # <- THEEK KIYA GAYA
+      - ./uploads:/app/uploads
+      - ./models:/app/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,16 +59,16 @@ services:
     ports:
       - "${MARK_SERVICE_PORT:-5020}:5020"
     env_file:
-      - ./.env # <- THEEK KIYA GAYA
+      - ./.env
     environment:
       - PORT=${MARK_SERVICE_PORT:-5020}
       - MARK_SERVICE_PORT=${MARK_SERVICE_PORT:-5020}
       - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
     volumes:
-      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
-      - ./models:/app/models # <- THEEK KIYA GAYA
+      - ./uploads:/app/uploads
+      - ./models:/app/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,16 +86,16 @@ services:
     ports:
       - "${VERIFY_SERVICE_PORT:-5030}:5030"
     env_file:
-      - ./.env # <- THEEK KIYA GAYA
+      - ./.env
     environment:
       - PORT=${VERIFY_SERVICE_PORT:-5030}
       - VERIFY_SERVICE_PORT=${VERIFY_SERVICE_PORT:-5030}
       - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
     volumes:
-      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
-      - ./models:/app/models # <- THEEK KIYA GAYA
+      - ./uploads:/app/uploads
+      - ./models:/app/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -112,16 +113,16 @@ services:
     ports:
       - "${REGISTER_SERVICE_PORT:-5040}:5040"
     env_file:
-      - ./.env # <- THEEK KIYA GAYA
+      - ./.env
     environment:
       - PORT=${REGISTER_SERVICE_PORT:-5040}
       - REGISTER_SERVICE_PORT=${REGISTER_SERVICE_PORT:-5040}
       - DB_HOST=postgres
-      - DB_PORT=5432
+      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
     volumes:
-      - ./uploads:/app/uploads # <- THEEK KIYA GAYA
-      - ./models:/app/models # <- THEEK KIYA GAYA
+      - ./uploads:/app/uploads
+      - ./models:/app/models
     depends_on:
       postgres:
         condition: service_healthy

@@ -11,12 +11,12 @@ services:
     ports:
       - "${PORT:-5010}:5010"
     env_file:
-      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
+      - ./.env
     environment:
-      - PORT=${PORT:-5010} # <- PORT ko override karega
+      - PORT=${PORT:-5010}
       - NODE_ENV=${NODE_ENV:-production}
     networks:
-      - attendance-net
+      - facial-net  # <-- FIX 1: Ise 'attendance-net' se badla
     restart: unless-stopped
 
   # Mark Service (Port 5020)
@@ -29,13 +29,13 @@ services:
     ports:
       - "${MARK_SERVICE_PORT:-5020}:5020"
     env_file:
-      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
+      - ./.env
     environment:
-      - PORT=${MARK_SERVICE_PORT:-5020} # <- PORT ko override karega
+      - PORT=${MARK_SERVICE_PORT:-5020}
       - MARK_SERVICE_PORT=${MARK_SERVICE_PORT:-5020}
       - NODE_ENV=${NODE_ENV:-production}
     networks:
-      - attendance-net
+      - facial-net  # <-- FIX 1: Ise 'attendance-net' se badla
     restart: unless-stopped
 
   # Verify Service (Port 5030)
@@ -48,13 +48,13 @@ services:
     ports:
       - "${VERIFY_SERVICE_PORT:-5030}:5030"
     env_file:
-      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
+      - ./.env
     environment:
-      - PORT=${VERIFY_SERVICE_PORT:-5030} # <- PORT ko override karega
+      - PORT=${VERIFY_SERVICE_PORT:-5030}
       - VERIFY_SERVICE_PORT=${VERIFY_SERVICE_PORT:-5030}
       - NODE_ENV=${NODE_ENV:-production}
     networks:
-      - attendance-net
+      - facial-net  # <-- FIX 1: Ise 'attendance-net' se badla
     restart: unless-stopped
 
   # Register Service (Port 5040)
@@ -67,19 +67,18 @@ services:
     ports:
       - "${REGISTER_SERVICE_PORT:-5040}:5040"
     env_file:
-      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
+      - ./.env
     environment:
-      - PORT=${REGISTER_SERVICE_PORT:-5040} # <- PORT ko override karega
+      - PORT=${REGISTER_SERVICE_PORT:-5040}
       - REGISTER_SERVICE_PORT=${REGISTER_SERVICE_PORT:-5040}
       - NODE_ENV=${NODE_ENV:-production}
     networks:
-      - attendance-net
+      - facial-net  # <-- FIX 1: Ise 'attendance-net' se badla
     restart: unless-stopped
 
 # Database volume ki bhi zaroorat nahi hai
 volumes: {}
 
 networks:
-  attendance-net:
-    name: attendance-net
-    driver: bridge
+  facial-net:       # <-- FIX 2: Ise 'attendance-net' se badla
+    external: true  # <-- FIX 2: Ise external banaya

@@ -4,14 +4,18 @@ FROM node:18-alpine
 # 2. App ke liye ek folder banayein container ke andar
 WORKDIR /app
 
-# 3. package.json aur lock file copy karein
+# 3. [FIX] node-gyp (jo native addons compile karta hai) ke liye build tools install karein
+# Yeh 'node-pre-gyp' error ko solve karega
+RUN apk add --no-cache python3 make g++
+
+# 4. package.json aur lock file copy karein
 COPY package*.json ./
 
-# 4. Dependencies install karein (sirf production waali)
+# 5. Dependencies install karein (sirf production waali)
 RUN npm install --production
 
-# 5. Baaki saara code copy karein (server.js, backend/ folder, etc.)
+# 6. Baaki saara code copy karein (server.js, backend/ folder, etc.)
 COPY . .
 
-# 6. Default command (yeh docker-compose mein override ho jaayegi)
+# 7. Default command (yeh docker-compose mein override ho jaayegi)
 CMD ["node", "server.js"]

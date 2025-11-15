@@ -4,9 +4,9 @@ FROM node:18-alpine
 # 2. App ke liye ek folder banayein container ke andar
 WORKDIR /app
 
-# 3. [FIX] node-gyp (jo native addons compile karta hai) ke liye build tools install karein
-# Yeh 'node-pre-gyp' error ko solve karega
-RUN apk add --no-cache python3 make g++
+# 3. [FIX] 'canvas' package ke liye zaroori build tools aur libraries install karein
+# Yeh node-gyp build errors ko solve karega
+RUN apk add --no-cache python3 build-base cairo-dev jpeg-dev pango-dev giflib-dev
 
 # 4. package.json aur lock file copy karein
 COPY package*.json ./

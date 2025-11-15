@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  gateway:
+    build: ./ # Maan rahe hain main service root mein hai
+    container_name: api_gateway
+    ports:
+      - "5010:5010"
+    env_file:
+      - ./.env
+
+  mark_service:
+    build: ./mark-service # Apne mark service ke folder ka path dein
+    container_name: mark_service
+    ports:
+      - "5020:5020"
+    env_file:
+      - ./.env
+
+  verify_service:
+    build: ./verify-service # Apne verify service ke folder ka path dein
+    container_name: verify_service
+    ports:
+      - "5030:5030"
+    env_file:
+      - ./.env
+
+  register_service:
+    build: ./register-service # Apne register service ke folder ka path dein
+    container_name: register_service
+    ports:
+      - "5040:5040"
+    env_file:
+      - ./.env

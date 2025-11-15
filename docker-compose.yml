@@ -1,29 +1,7 @@
 version: "3.9"
 
 services:
-  # PostgreSQL Database Service
-  postgres:
-    image: postgres:15-alpine
-    container_name: attendance-postgres
-    environment:
-      POSTGRES_DB: ${DB_NAME:-anocab_db}
-      POSTGRES_USER: ${DB_USER:-anocabuser}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-AnoCab@12345}
-    ports:
-      # [FIX] Host port ko 5432 se 5434 kar diya taaki conflict na ho
-      - "${DB_PORT:-5434}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - attendance-net
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-anocabuser}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Main Service (Aapka Port 5010)
+  # Main Service (Port 5010)
   main-service:
     build:
       context: .
@@ -33,23 +11,15 @@ services:
     ports:
       - "${PORT:-5010}:5010"
     env_file:
-      - ./.env
+      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
     environment:
-      - PORT=${PORT:-5010}
-      - DB_HOST=postgres
-      - DB_PORT=5432 # <- Yeh 5432 hi rahega, kyunki yeh internal network port hai
+      - PORT=${PORT:-5010} # <- PORT ko override karega
       - NODE_ENV=${NODE_ENV:-production}
-    volumes:
-      - ./uploads:/app/uploads
-      - ./models:/app/models
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - attendance-net
     restart: unless-stopped
 
-  # Mark Service (Aapka Port 5020)
+  # Mark Service (Port 5020)
   mark-service:
     build:
       context: .
@@ -59,24 +29,16 @@ services:
     ports:
       - "${MARK_SERVICE_PORT:-5020}:5020"
     env_file:
-      - ./.env
+      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
     environment:
-      - PORT=${MARK_SERVICE_PORT:-5020}
+      - PORT=${MARK_SERVICE_PORT:-5020} # <- PORT ko override karega
       - MARK_SERVICE_PORT=${MARK_SERVICE_PORT:-5020}
-      - DB_HOST=postgres
-      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
-    volumes:
-      - ./uploads:/app/uploads
-      - ./models:/app/models
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - attendance-net
     restart: unless-stopped
 
-  # Verify Service (Aapka Port 5030)
+  # Verify Service (Port 5030)
   verify-service:
     build:
       context: .
@@ -86,24 +48,16 @@ services:
     ports:
       - "${VERIFY_SERVICE_PORT:-5030}:5030"
     env_file:
-      - ./.env
+      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
     environment:
-      - PORT=${VERIFY_SERVICE_PORT:-5030}
+      - PORT=${VERIFY_SERVICE_PORT:-5030} # <- PORT ko override karega
       - VERIFY_SERVICE_PORT=${VERIFY_SERVICE_PORT:-5030}
-      - DB_HOST=postgres
-      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
-    volumes:
-      - ./uploads:/app/uploads
-      - ./models:/app/models
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - attendance-net
     restart: unless-stopped
 
-  # Register Service (Aapka Port 5040)
+  # Register Service (Port 5040)
   register-service:
     build:
       context: .
@@ -113,26 +67,17 @@ services:
     ports:
       - "${REGISTER_SERVICE_PORT:-5040}:5040"
     env_file:
-      - ./.env
+      - ./.env # <- Yeh aapke DB_HOST, DB_PORT, etc. ko load karega
     environment:
-      - PORT=${REGISTER_SERVICE_PORT:-5040}
+      - PORT=${REGISTER_SERVICE_PORT:-5040} # <- PORT ko override karega
       - REGISTER_SERVICE_PORT=${REGISTER_SERVICE_PORT:-5040}
-      - DB_HOST=postgres
-      - DB_PORT=5432 # <- Yeh 5432 hi rahega
       - NODE_ENV=${NODE_ENV:-production}
-    volumes:
-      - ./uploads:/app/uploads
-      - ./models:/app/models
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks:
       - attendance-net
     restart: unless-stopped
 
-volumes:
-  postgres_data:
-    driver: local
+# Database volume ki bhi zaroorat nahi hai
+volumes: {}
 
 networks:
   attendance-net:

@@ -1,0 +1,21 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main # Apni branch ka naam 'main' ya 'master' daalein
+
+jobs:
+  deploy:
+    # Sabse zaroori: Yeh job aapke VPS par chalegi
+    runs-on: self-hosted
+
+    steps:
+      - name: 1. Code Checkout
+        uses: actions/checkout@v4
+
+      - name: 2. Build and Restart Docker Containers
+        run: docker compose up --build -d --remove-orphans
+        
+      - name: 3. Clean Up Old Images
+        run: docker image prune -f

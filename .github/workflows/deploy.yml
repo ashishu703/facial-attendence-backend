@@ -14,8 +14,15 @@ jobs:
       - name: 1. Code Checkout
         uses: actions/checkout@v4
 
-      - name: 2. Build and Restart Docker Containers
+      # --- YEH STEP ADD KAREIN ---
+      - name: 2. Stop and Remove Old Containers
+        run: docker compose down
+      # --------------------------
+
+      - name: 3. Build and Start New Containers
+        # Step 2 ka naam badal kar 3 kar diya hai
         run: docker compose up --build -d --remove-orphans
         
-      - name: 3. Clean Up Old Images
+      - name: 4. Clean Up Old Images
+        # Step 3 ka naam badal kar 4 kar diya hai
         run: docker image prune -f

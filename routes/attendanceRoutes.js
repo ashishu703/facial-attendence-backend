@@ -12,7 +12,8 @@ const {
   isWithinCheckInWindow,
   isWithinCheckOutWindow,
   findShiftByCheckInWindow,
-  findShiftForPunchWithGrace
+  findShiftForPunchWithGrace,
+  buildLocalTime
 } = require('../services/attendanceLogicService');
 const { 
   recordPresenceDetection, 
@@ -324,9 +325,22 @@ router.post('/mark', protect, upload.single('image'), async (req, res) => {
         }
       }
 
+      // Calculate delay at check-in so that late arrivals are visible on dashboards
+      let delayAtCheckInMinutes = 0;
+      try {
+        const shiftStart = buildLocalTime(checkInTime, matchShift.startHour, matchShift.startMinute);
+        if (checkInTime.getTime() > shiftStart.getTime()) {
+          delayAtCheckInMinutes = Math.round(
+            (checkInTime.getTime() - shiftStart.getTime()) / (1000 * 60)
+          );
+        }
+      } catch (err) {
+        console.error('Error calculating delay at check-in:', err);
+      }
+
       await db.query(
-        'INSERT INTO attendance_records (employee_id, attendance_date, in_time, location_in) VALUES ($1, $2, $3::timestamp, $4)',
-        [employee_id, date, timestampStr, location]
+        'INSERT INTO attendance_records (employee_id, attendance_date, in_time, location_in, delay_by_minutes) VALUES ($1, $2, $3::timestamp, $4, $5)',
+        [employee_id, date, timestampStr, location, delayAtCheckInMinutes]
       );
 
       // Get employee details for notification

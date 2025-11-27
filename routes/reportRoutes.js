@@ -239,6 +239,7 @@ router.get('/detailed-report', protect, async (req, res) => {
     
     let query = `
       SELECT 
+        ar.attendance_id,
         e.employee_code,
         e.employee_name,
         e.employee_type,
@@ -249,8 +250,12 @@ router.get('/detailed-report', protect, async (req, res) => {
         ar.delay_by_minutes,
         ar.extra_time_minutes,
         ar.total_working_hours_decimal,
+        COALESCE(ar.ot_hours_decimal, 0) as ot_hours_decimal,
         ar.location_in,
         ar.location_out,
+        ar.is_edited,
+        ar.edit_remark,
+        ar.edited_at,
         CASE 
           WHEN (
             SELECT COUNT(*) FROM attendance_records ar2 
@@ -307,37 +312,70 @@ router.get('/detailed-report', protect, async (req, res) => {
     // Recalculate metrics and add early checkout for each row
     const processedRows = await Promise.all(rows.map(async (row) => {
       let early_checkout_minutes = 0;
+      const dbOTHours = parseFloat(row.ot_hours_decimal) || 0;
+      
       let recalculatedMetrics = {
         delay_by_minutes: row.delay_by_minutes || 0,
         extra_time_minutes: row.extra_time_minutes || 0,
-        total_working_hours_decimal: row.total_working_hours_decimal || 0
+        total_working_hours_decimal: row.total_working_hours_decimal || 0,
+        ot_hours_decimal: dbOTHours
       };
       
       if (row.out_time && row.in_time && row.employee_type) {
         try {
-          // Recalculate all metrics using the fixed calculation
           const isOTShift = row.is_ot || false;
           const metrics = await calculateAttendanceMetrics(row.in_time, row.out_time, row.employee_type, isOTShift);
-          recalculatedMetrics = {
-            delay_by_minutes: metrics.delay_by_minutes,
-            extra_time_minutes: metrics.extra_time_minutes,
-            total_working_hours_decimal: metrics.total_working_hours_decimal
-          };
           
-          // Calculate early checkout
+          // Calculate regular shift hours and early checkout
           const shifts = await getAllShifts(row.employee_type);
+          let regularShiftHours = 0;
+          
           if (shifts.length > 0) {
             const inTime = new Date(row.in_time);
             const outTime = new Date(row.out_time);
             const detectedShiftResult = detectShiftForTime(inTime, shifts);
             const shift = detectedShiftResult?.shift || shifts[0];
+            const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
             const shiftEndTime = buildShiftEndTime(inTime, shift);
             
-            // Early checkout = shift end time - checkout time (if checkout is before shift end)
-            if (outTime.getTime() < shiftEndTime.getTime()) {
+            // Regular shift hours calculation:
+            // - If checkout >= shift end: regularShiftHours = shift end - shift start
+            // - If checkout < shift end: regularShiftHours = checkout - shift start
+            if (outTime.getTime() >= shiftEndTime.getTime()) {
+              // Checkout is at or after shift end: regular hours = full shift duration
+              regularShiftHours = Math.max(0, parseFloat(((shiftEndTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
+            } else {
+              // Early checkout: regular hours = actual worked hours
+              regularShiftHours = Math.max(0, parseFloat(((outTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
               early_checkout_minutes = Math.round((shiftEndTime.getTime() - outTime.getTime()) / (1000 * 60));
             }
           }
+          
+          // Determine OT hours: use DB value if exists (manually set), otherwise use calculated
+          const finalOTHours = dbOTHours > 0 ? dbOTHours : (metrics.ot_hours_decimal || 0);
+          
+          // Total hours calculation:
+          // - If manual OT is set: Total = Actual Worked Hours (checkout - checkin) + Manual OT
+          // - If auto-calculated OT exists: Total = Regular Shift Hours + Auto OT
+          // - If no OT: Total = Actual Worked Hours (checkout - checkin)
+          let finalTotalHours;
+          if (dbOTHours > 0) {
+            // Manual OT: Add to actual worked hours
+            finalTotalHours = Math.max(0, parseFloat((metrics.total_working_hours_decimal + dbOTHours).toFixed(2)));
+          } else if (finalOTHours > 0) {
+            // Auto-calculated OT: Add to regular shift hours
+            finalTotalHours = Math.max(0, parseFloat((regularShiftHours + finalOTHours).toFixed(2)));
+          } else {
+            // No OT: Use actual worked hours
+            finalTotalHours = metrics.total_working_hours_decimal;
+          }
+          
+          recalculatedMetrics = {
+            delay_by_minutes: metrics.delay_by_minutes,
+            extra_time_minutes: metrics.extra_time_minutes,
+            total_working_hours_decimal: finalTotalHours,
+            ot_hours_decimal: finalOTHours
+          };
         } catch (err) {
           console.error('Error recalculating metrics:', err);
         }
@@ -348,6 +386,7 @@ router.get('/detailed-report', protect, async (req, res) => {
         delay_by_minutes: recalculatedMetrics.delay_by_minutes,
         extra_time_minutes: recalculatedMetrics.extra_time_minutes,
         total_working_hours_decimal: recalculatedMetrics.total_working_hours_decimal,
+        ot_hours_decimal: recalculatedMetrics.ot_hours_decimal || 0,
         early_checkout_minutes: Math.max(0, early_checkout_minutes)
       };
     }));

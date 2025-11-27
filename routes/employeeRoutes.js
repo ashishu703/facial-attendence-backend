@@ -15,6 +15,9 @@ async function ensureEmployeeTypeEnum() {
         IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_enum e ON t.oid = e.enumtypid WHERE t.typname='employee_type_enum' AND e.enumlabel='Factory Staff') THEN
           ALTER TYPE employee_type_enum ADD VALUE 'Factory Staff';
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_enum e ON t.oid = e.enumtypid WHERE t.typname='employee_type_enum' AND e.enumlabel='Factory Office Staff') THEN
+          ALTER TYPE employee_type_enum ADD VALUE 'Factory Office Staff';
+        END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_enum e ON t.oid = e.enumtypid WHERE t.typname='employee_type_enum' AND e.enumlabel='Intern') THEN
           ALTER TYPE employee_type_enum ADD VALUE 'Intern';
         END IF;

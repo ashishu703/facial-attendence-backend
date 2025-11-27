@@ -2,6 +2,18 @@ const db = require('../config/db');
 const ZERO_METRICS = { delay_by_minutes: 0, extra_time_minutes: 0, total_working_hours_decimal: 0, ot_hours_decimal: 0 };
 const MIN_OT_MINUTES = parseInt(process.env.MIN_OT_MINUTES || '15', 10);
 
+// Business/local timezone offset (in minutes) relative to UTC.
+// Example: IST = +330 minutes. Defaulting to 330 for India-focused deployment.
+const LOCAL_TIME_OFFSET_MINUTES = parseInt(process.env.LOCAL_TIME_OFFSET_MINUTES || '330', 10);
+
+function toLocalTime(date) {
+  if (!(date instanceof Date) || isNaN(date.getTime())) return date;
+  if (!Number.isFinite(LOCAL_TIME_OFFSET_MINUTES) || LOCAL_TIME_OFFSET_MINUTES === 0) {
+    return date;
+  }
+  return new Date(date.getTime() + LOCAL_TIME_OFFSET_MINUTES * 60 * 1000);
+}
+
 const parseTime = (timeStr) => {
   const raw = String(timeStr).trim();
   const upper = raw.toUpperCase();
@@ -147,8 +159,11 @@ async function calculateAttendanceMetrics(inTimeStr, outTimeStr, employeeType, i
   const shifts = await getAllShifts(employeeType);
   if (shifts.length === 0) return ZERO_METRICS;
 
-  const inTime = new Date(inTimeStr);
-  const outTime = new Date(outTimeStr);
+  // Convert raw timestamps (typically UTC from DB / client) into business local time
+  // so that comparisons against shift start/end (which are defined in local time)
+  // are accurate. Without this, delay/OT can be off by the timezone offset.
+  const inTime = toLocalTime(new Date(inTimeStr));
+  const outTime = toLocalTime(new Date(outTimeStr));
 
   if (isNaN(inTime.getTime()) || isNaN(outTime.getTime()) || outTime.getTime() <= inTime.getTime()) {
     return ZERO_METRICS;
@@ -203,6 +218,7 @@ module.exports = {
   findShiftForPunchWithGrace,
   getShiftEndWithGrace,
   buildLocalTime,
-  buildShiftEndTime
+  buildShiftEndTime,
+  toLocalTime
 };
 

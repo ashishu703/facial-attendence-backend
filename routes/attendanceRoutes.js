@@ -13,7 +13,8 @@ const {
   isWithinCheckOutWindow,
   findShiftByCheckInWindow,
   findShiftForPunchWithGrace,
-  buildLocalTime
+  buildLocalTime,
+  toLocalTime
 } = require('../services/attendanceLogicService');
 const { 
   recordPresenceDetection, 
@@ -126,7 +127,10 @@ const ensureMultiPunchSupport = async () => {
   constraintAdjusted = true;
 };
 
-router.post('/mark', protect, upload.single('image'), async (req, res) => {
+// NOTE: This route is intentionally left UNPROTECTED (no JWT required).
+// Face + DB matching is used to identify the employee; frontend should be able
+// to call this even before login / without token.
+router.post('/mark', upload.single('image'), async (req, res) => {
   const startTime = Date.now();
   const requestId = `MARK-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   
@@ -197,7 +201,9 @@ router.post('/mark', protect, upload.single('image'), async (req, res) => {
     console.log(`[${requestId}] ✅ FACE MATCHED: ${bestMatch.employee_name} (${processingTime}ms)`);
 
     const { employee_id, employee_name, employee_type } = bestMatch;
-    const checkInTime = new Date(timestampStr);
+    // Convert client timestamp (ISO/UTC) into business local time for all
+    // shift-window and delay calculations.
+    const checkInTime = toLocalTime(new Date(timestampStr));
     const shifts = await getAllShifts(employee_type);
     
     if (shifts.length === 0) {

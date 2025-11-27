@@ -30,6 +30,7 @@ router.get('/organization-stats', protect, async (req, res) => {
         LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id
         GROUP BY o.organization_id, o.organization_name
       ),
+      -- Employees counted as OT only if they actually have OT hours recorded
       ot_stats AS (
         SELECT 
           e.organization_id,
@@ -37,12 +38,7 @@ router.get('/organization-stats', protect, async (req, res) => {
         FROM employee_details e
         JOIN attendance_records ar ON ar.employee_id = e.employee_id
         WHERE ar.attendance_date = $1
-        AND (
-          SELECT COUNT(*) FROM attendance_records ar2 
-          WHERE ar2.employee_id = e.employee_id 
-          AND ar2.attendance_date = $1 
-          AND ar2.out_time IS NOT NULL
-        ) > 0
+          AND COALESCE(ar.ot_hours_decimal, 0) > 0
         GROUP BY e.organization_id
       )
       SELECT 
@@ -154,12 +150,13 @@ router.get('/employee-attendance', protect, async (req, res) => {
           ar.in_time,
           ar.out_time,
           ar.total_working_hours_decimal as total_hours,
+          -- Mark employee as OT only if any record for the day has OT hours > 0
           CASE 
             WHEN EXISTS (
               SELECT 1 FROM attendance_records ar2 
               WHERE ar2.employee_id = e.employee_id 
-              AND ar2.attendance_date = $1 
-              AND ar2.out_time IS NOT NULL
+                AND ar2.attendance_date = $1 
+                AND COALESCE(ar2.ot_hours_decimal, 0) > 0
             ) THEN true
             ELSE false
           END as is_ot,

@@ -9,9 +9,6 @@ const {
   calculateAttendanceMetrics, 
   getAllShifts, 
   detectShiftForTime,
-  isWithinCheckInWindow,
-  isWithinCheckOutWindow,
-  findShiftByCheckInWindow,
   findShiftForPunchWithGrace,
   buildLocalTime,
   toLocalTime
@@ -24,6 +21,32 @@ const { triggerAttendanceNotifications } = require('../services/notificationServ
 const { protect } = require('../middleware/authMiddleware');
 
 const router = express.Router();
+
+// Utility: format a date in IST for email display
+function formatISTDate(dateLike) {
+  if (!dateLike) return '';
+  const d = new Date(dateLike);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-IN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: 'Asia/Kolkata',
+  });
+}
+
+function formatISTTime(dateLike) {
+  if (!dateLike) return '';
+  const d = new Date(dateLike);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+    timeZone: 'Asia/Kolkata',
+  });
+}
 
 // Helper function to count completed shifts for an employee on a given date
 async function getCompletedCount(employeeId, date) {
@@ -112,8 +135,11 @@ setInterval(autoCheckoutOverdueShifts, 60 * 60 * 1000);
 
 
 const upload = multer({
-  dest: process.env.UPLOAD_PATH,
-  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE) },
+  // Fallback to local `uploads/` if UPLOAD_PATH is not configured
+  dest: process.env.UPLOAD_PATH || 'uploads/',
+  limits: {
+    fileSize: parseInt(process.env.MAX_FILE_SIZE || `${5 * 1024 * 1024}`, 10), // default 5MB
+  },
 });
 
 const FACE_MATCH_THRESHOLD = 0.45; // Stricter threshold for better security
@@ -159,11 +185,31 @@ router.post('/mark', upload.single('image'), async (req, res) => {
   try {
     await ensureMultiPunchSupport();
     const imagePath = path.resolve(req.file.path);
-    const imageBuffer = fs.readFileSync(imagePath);
+
+    let imageBuffer;
+    try {
+      imageBuffer = fs.readFileSync(imagePath);
+    } catch (readErr) {
+      console.error(`[${requestId}] ❌ Error reading uploaded image:`, readErr);
+      return res.status(500).json({ message: 'Error reading uploaded image.' });
+    }
     
     console.log(`[${requestId}] Step 1: Extracting face embedding...`);
-    const embedding = await getFaceEmbedding(imageBuffer);
-    fs.unlinkSync(imagePath);
+    let embedding;
+    try {
+      embedding = await getFaceEmbedding(imageBuffer);
+    } catch (embedErr) {
+      console.error(`[${requestId}] ❌ Error during face detection/embedding:`, embedErr);
+      try {
+        fs.unlinkSync(imagePath);
+      } catch (_e) {}
+      return res.status(400).json({
+        message: embedErr.message || 'Error processing face image.',
+      });
+    }
+    try {
+      fs.unlinkSync(imagePath);
+    } catch (_e) {}
 
     if (!embedding) {
       console.log(`[${requestId}] ❌ No face detected in image`);
@@ -268,13 +314,9 @@ router.post('/mark', upload.single('image'), async (req, res) => {
         const empData = empDetails.rows[0];
         console.log(`[ATTENDANCE] 📧 Preparing to send notifications for ${employee_name} (checked_out)`);
         console.log(`[ATTENDANCE] Employee email: ${empData.email || 'NOT SET'}`);
-        
-        // Format date for notification
-        const notificationDate = new Date(date).toLocaleDateString('en-IN', {
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit'
-        });
+       
+        // Format date/time for notification explicitly in IST (Asia/Kolkata)
+        const notificationDate = formatISTDate(timestampStr);
         
         triggerAttendanceNotifications('checked_out', {
           employee_id,
@@ -282,9 +324,9 @@ router.post('/mark', upload.single('image'), async (req, res) => {
           employee_code: empData.employee_code || '',
           organization_name: empData.organization_name || '',
           date: notificationDate,
-          time: new Date(timestampStr).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
-          in_time: new Date(record.in_time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
-          out_time: new Date(timestampStr).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
+          time: formatISTTime(timestampStr),
+          in_time: formatISTTime(record.in_time),
+          out_time: formatISTTime(timestampStr),
           total_hours: updatedRecord.rows[0].total_working_hours_decimal,
           status: 'checked_out',
         }).catch(err => {
@@ -363,13 +405,9 @@ router.post('/mark', upload.single('image'), async (req, res) => {
         const empData = empDetails.rows[0];
         console.log(`[ATTENDANCE] 📧 Preparing to send notifications for ${employee_name} (checked_in)`);
         console.log(`[ATTENDANCE] Employee email: ${empData.email || 'NOT SET'}`);
-        
-        // Format date for notification
-        const notificationDate = new Date(date).toLocaleDateString('en-IN', {
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit'
-        });
+       
+        // Format date/time for notification explicitly in IST (Asia/Kolkata)
+        const notificationDate = formatISTDate(timestampStr);
         
         triggerAttendanceNotifications('checked_in', {
           employee_id,
@@ -377,8 +415,8 @@ router.post('/mark', upload.single('image'), async (req, res) => {
           employee_code: empData.employee_code || '',
           organization_name: empData.organization_name || '',
           date: notificationDate,
-          time: new Date(timestampStr).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
-          in_time: new Date(timestampStr).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }),
+          time: formatISTTime(timestampStr),
+          in_time: formatISTTime(timestampStr),
           status: 'checked_in',
         }).catch(err => {
           console.error('[ATTENDANCE] ❌ Notification trigger error:', err);

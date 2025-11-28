@@ -186,17 +186,20 @@ router.post('/register', protect, upload.single('image'), async (req, res) => {
       }
     }
 
-    // Trigger registration email notification
-    const registrationDate = new Date().toLocaleDateString('en-IN', {
+    // Trigger registration email notification using business local time (e.g. IST)
+    const now = new Date();
+    const registrationDate = now.toLocaleDateString('en-IN', {
       year: 'numeric',
       month: '2-digit',
-      day: '2-digit'
+      day: '2-digit',
+      timeZone: 'Asia/Kolkata',
     });
-    const registrationTime = new Date().toLocaleTimeString('en-IN', {
+    const registrationTime = now.toLocaleTimeString('en-IN', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-      hour12: true
+      hour12: true,
+      timeZone: 'Asia/Kolkata',
     });
 
     console.log('[REGISTER] 📧 Preparing to send registration notification...');

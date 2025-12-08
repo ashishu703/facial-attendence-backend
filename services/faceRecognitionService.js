@@ -9,135 +9,116 @@ faceapi.env.monkeyPatch({
   ImageData: canvas.ImageData
 });
 
-const MODEL_PATH = path.join(__dirname, '../models');
-let useTinyFaceDetector = false;
+class FaceRecognitionService {
+  constructor() {
+    this.MODEL_PATH = path.join(__dirname, '../models');
+    this.modelsLoaded = false;
+    this.loadingPromise = null;
+  }
 
-async function loadModels() {
-  try {
-    console.log('Loading face-api models...');
-    await faceapi.tf.ready();
+  async loadModels() {
+    if (this.modelsLoaded) return;
+    if (this.loadingPromise) return this.loadingPromise;
+    
+    this.loadingPromise = this._loadModelsInternal();
+    return this.loadingPromise;
+  }
 
-    try {
-      await faceapi.nets.tinyFaceDetector.loadFromDisk(MODEL_PATH);
-      useTinyFaceDetector = true;
-      console.log('✓ TinyFaceDetector loaded (faster model)');
-    } catch (_) {
-      console.log('⚠ TinyFaceDetector not found, using SSD MobileNet (slower but available)');
-      await faceapi.nets.ssdMobilenetv1.loadFromDisk(MODEL_PATH);
-      useTinyFaceDetector = false;
+  async _loadModelsInternal() {
+    const fs = require('fs');
+    const requiredFiles = [
+      'tiny_face_detector_model-weights_manifest.json',
+      'tiny_face_detector_model-shard1',
+      'face_landmark_68_model-weights_manifest.json',
+      'face_landmark_68_model-shard1',
+      'face_recognition_model-weights_manifest.json',
+      'face_recognition_model-shard1',
+      'face_recognition_model-shard2'
+    ];
+
+    for (const file of requiredFiles) {
+      const filePath = require('path').join(this.MODEL_PATH, file);
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Model file missing: ${file}. Please run: npm run download-models`);
+      }
     }
 
-    await faceapi.nets.faceLandmark68Net.loadFromDisk(MODEL_PATH);
-    await faceapi.nets.faceRecognitionNet.loadFromDisk(MODEL_PATH);
-
-    console.log('Face-API models loaded successfully.');
-    console.log(
-      useTinyFaceDetector
-        ? 'Using TinyFaceDetector - Expected: 5-8 seconds per request'
-        : 'Using SSD MobileNet with optimizations - Expected: 8-12 seconds per request'
-    );
-  } catch (error) {
-    console.error('Error loading models:', error);
-    throw error;
+    await faceapi.tf.ready();
+    await faceapi.nets.tinyFaceDetector.loadFromDisk(this.MODEL_PATH);
+    await faceapi.nets.faceLandmark68Net.loadFromDisk(this.MODEL_PATH);
+    await faceapi.nets.faceRecognitionNet.loadFromDisk(this.MODEL_PATH);
+    this.modelsLoaded = true;
   }
-}
 
-function resizeToCanvas(image) {
-  const MAX_WIDTH = 640;
-  let width = image.width;
-  let height = image.height;
-  if (width > MAX_WIDTH) {
-    height = (height * MAX_WIDTH) / width;
-    width = MAX_WIDTH;
+  resizeToCanvas(image, maxWidth = 640) {
+    let width = image.width;
+    let height = image.height;
+    if (width > maxWidth) {
+      height = (height * maxWidth) / width;
+      width = maxWidth;
+    }
+    const c = createCanvas(width, height);
+    const ctx = c.getContext('2d');
+    ctx.drawImage(image, 0, 0, width, height);
+    return c;
   }
-  const c = createCanvas(width, height);
-  const ctx = c.getContext('2d');
-  ctx.drawImage(image, 0, 0, width, height);
-  return c;
-}
 
-async function detectFacesWithDescriptor(srcCanvas) {
-  if (useTinyFaceDetector) {
-    const opts = new faceapi.TinyFaceDetectorOptions({
-      inputSize: 320,
+  _getDetectorOptions(inputSize = 320) {
+    return new faceapi.TinyFaceDetectorOptions({
+      inputSize,
       scoreThreshold: 0.5
     });
+  }
+
+  async detectFacesWithDescriptor(srcCanvas) {
+    const opts = this._getDetectorOptions(320);
     return faceapi
       .detectAllFaces(srcCanvas, opts)
       .withFaceLandmarks()
       .withFaceDescriptors();
   }
-  const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
-  return faceapi
-    .detectAllFaces(srcCanvas, opts)
-    .withFaceLandmarks()
-    .withFaceDescriptors();
-}
 
-async function getFaceEmbedding(imageBuffer) {
-  try {
+  async detectFaceOnly(srcCanvas) {
+    const opts = this._getDetectorOptions(224);
+    return faceapi.detectSingleFace(srcCanvas, opts);
+  }
+
+  async getFaceEmbedding(imageBuffer) {
+    if (!this.modelsLoaded) {
+      await this.loadModels();
+    }
     const img = await loadImage(imageBuffer);
-    const c = resizeToCanvas(img);
-    const detections = await detectFacesWithDescriptor(c);
+    const c = this.resizeToCanvas(img);
+    const detections = await this.detectFacesWithDescriptor(c);
     if (!detections || detections.length === 0) {
       throw new Error('No faces detected in the image');
     }
     return detections[0].descriptor;
-  } catch (error) {
-    console.error('Error in getFaceEmbedding:', error);
-    throw error;
   }
-}
 
-// Lightweight face detection - NO landmarks, NO descriptors (MUCH FASTER!)
-async function detectFaceOnly(srcCanvas) {
-  if (useTinyFaceDetector) {
-    const opts = new faceapi.TinyFaceDetectorOptions({
-      inputSize: 224, // Reduced from 320 for faster processing
-      scoreThreshold: 0.5
-    });
-    return faceapi.detectSingleFace(srcCanvas, opts); // detectSingleFace is faster than detectAllFaces
-  }
-  const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
-  return faceapi.detectSingleFace(srcCanvas, opts);
-}
-
-async function getFaceBoxNormalized(imageBuffer) {
-  try {
+  async getFaceBoxNormalized(imageBuffer) {
+    if (!this.modelsLoaded) {
+      await this.loadModels();
+    }
     const img = await loadImage(imageBuffer);
-    
-    // Use smaller canvas for faster detection
-    const MAX_WIDTH = 320; // Reduced from 640
-    let width = img.width;
-    let height = img.height;
-    if (width > MAX_WIDTH) {
-      height = (height * MAX_WIDTH) / width;
-      width = MAX_WIDTH;
-    }
-    const c = createCanvas(width, height);
-    const ctx = c.getContext('2d');
-    ctx.drawImage(img, 0, 0, width, height);
-    
-    // Use lightweight detection (no landmarks, no descriptors)
-    const detection = await detectFaceOnly(c);
-    
-    if (!detection) {
-      return null;
-    }
+    const c = this.resizeToCanvas(img, 320);
+    const detection = await this.detectFaceOnly(c);
+    if (!detection) return null;
     
     const box = detection.box;
-    const norm = {
+    return {
       x: box.x / c.width,
       y: box.y / c.height,
       width: box.width / c.width,
-      height: box.height / c.height,
+      height: box.height / c.height
     };
-    return norm;
-  } catch (error) {
-    console.error('Error in getFaceBoxNormalized:', error);
-    return null;
   }
 }
 
-module.exports = { loadModels, getFaceEmbedding, getFaceBoxNormalized };
+const faceRecognitionService = new FaceRecognitionService();
 
+module.exports = {
+  loadModels: () => faceRecognitionService.loadModels(),
+  getFaceEmbedding: (imageBuffer) => faceRecognitionService.getFaceEmbedding(imageBuffer),
+  getFaceBoxNormalized: (imageBuffer) => faceRecognitionService.getFaceBoxNormalized(imageBuffer)
+};

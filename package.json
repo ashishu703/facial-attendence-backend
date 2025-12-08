@@ -8,6 +8,7 @@
     "start:mark": "node server.mark.js",
     "start:verify": "node server.verify.js",
     "start:register": "node server.register.js",
+    "download-models": "node scripts/download-models-axios.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

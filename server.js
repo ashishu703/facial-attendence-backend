@@ -62,10 +62,21 @@ app.use('/api/reports', require('./routes/reportRoutes'));
 const { loadModels } = require('./services/faceRecognitionService');
 const { processAbsentMarking } = require('./services/absentMarkingService');
 const { clearOldDetections } = require('./services/presenceDetectionService');
+const { processYesterday: processDailyClosing } = require('./services/dailyClosingService');
+const { consolidateYesterday: consolidateDailyAttendance } = require('./services/dailyConsolidationService');
+const { ensureColumns } = require('./services/dbMigrationService');
 
 // Load models before starting the server
 loadModels()
-  .then(() => {
+  .then(async () => {
+    // Ensure database columns exist
+    try {
+      await ensureColumns();
+      console.log('[SERVER] ✅ Database migration completed');
+    } catch (error) {
+      console.error('[SERVER] ⚠️ Database migration error (may be safe if columns already exist):', error.message);
+    }
+
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server running on port ${PORT}`);
@@ -79,6 +90,43 @@ loadModels()
           console.error('Error in scheduled absent marking:', error);
         }
       }, 60 * 60 * 1000);
+      
+      // Daily closing job - runs once per day at configured time
+      const scheduleDailyClosingJob = () => {
+        const attendanceConfig = require('./services/attendanceConfigService');
+        const closingTime = attendanceConfig.DAILY_CLOSING_JOB_TIME || '23:30';
+        const [hour, minute] = closingTime.split(':').map(Number);
+        
+        const now = new Date();
+        const scheduledTime = new Date();
+        scheduledTime.setHours(hour, minute, 0, 0);
+        
+        // If scheduled time has passed today, schedule for tomorrow
+        if (scheduledTime <= now) {
+          scheduledTime.setDate(scheduledTime.getDate() + 1);
+        }
+        
+        const msUntilScheduled = scheduledTime.getTime() - now.getTime();
+        
+        console.log(`[SERVER] Daily closing job scheduled for ${scheduledTime.toISOString()}`);
+        
+        setTimeout(async () => {
+          console.log('[SERVER] Running daily closing job...');
+          try {
+            await processDailyClosing();
+            await consolidateDailyAttendance();
+            console.log('[SERVER] ✅ Daily closing job completed');
+          } catch (error) {
+            console.error('[SERVER] ❌ Error in daily closing job:', error);
+          }
+          
+          // Schedule next run (24 hours later)
+          scheduleDailyClosingJob();
+        }, msUntilScheduled);
+      };
+      
+      // Start daily closing job scheduler
+      scheduleDailyClosingJob();
       
       // Run immediately on startup (for testing/debugging)
       setTimeout(async () => {

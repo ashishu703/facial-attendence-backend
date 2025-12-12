@@ -18,6 +18,7 @@ const {
   checkPresenceRequirement 
 } = require('../services/presenceDetectionService');
 const { triggerAttendanceNotifications } = require('../services/notificationService');
+const { handlePunch } = require('../services/punchHandlingService');
 const { protect } = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -63,79 +64,8 @@ async function getCompletedCount(employeeId, date) {
   }
 }
 
-// Helper function removed - no auto check-in to next shift
-// Employee must manually check-in for each shift
-
-// Auto-checkout function for overdue shifts (4 hours after shift end)
-async function autoCheckoutOverdueShifts() {
-  try {
-    const { rows } = await db.query(
-      `SELECT r.*, d.employee_type, d.employee_name
-       FROM attendance_records r
-       JOIN employee_details d ON r.employee_id = d.employee_id
-       WHERE r.out_time IS NULL`
-    );
-
-    for (const record of rows) {
-      const shifts = await getAllShifts(record.employee_type);
-      if (shifts.length === 0) continue;
-
-      const inTime = new Date(record.in_time);
-      const detectedShift = detectShiftForTime(inTime, shifts);
-      const shift = detectedShift?.shift || shifts[0];
-      
-      // Calculate shift end time
-      const shiftEndTime = new Date(inTime);
-      shiftEndTime.setHours(shift.endHour, shift.endMinute, 0, 0);
-      if (shiftEndTime <= inTime) {
-        shiftEndTime.setDate(shiftEndTime.getDate() + 1);
-      }
-      
-      // Auto-checkout at shift end + 4 hours
-      const autoCheckoutTime = new Date(shiftEndTime.getTime() + 4 * 60 * 60 * 1000);
-      const now = new Date();
-      
-      // Check if current time >= shift end + 4 hours
-      if (now >= autoCheckoutTime) {
-        console.log(`[AUTO-CHECKOUT] Processing auto-checkout for ${record.employee_name} (ID: ${record.employee_id})`);
-        console.log(`[AUTO-CHECKOUT] Shift end: ${shiftEndTime.toISOString()}, Auto-checkout time: ${autoCheckoutTime.toISOString()}`);
-        
-        const completedCount = await getCompletedCount(record.employee_id, record.attendance_date);
-        const isOTShift = completedCount > 0;
-        
-        // Checkout at current time (shift end + 4 hours), not at shift end time
-        const checkoutTime = autoCheckoutTime.toISOString();
-        
-        const metrics = await calculateAttendanceMetrics(
-          record.in_time,
-          checkoutTime,
-          record.employee_type,
-          isOTShift
-        );
-
-        await db.query(
-          `UPDATE attendance_records
-           SET out_time = $1::timestamp, location_out = $2, delay_by_minutes = $3,
-               extra_time_minutes = $4, total_working_hours_decimal = $5
-           WHERE attendance_id = $6`,
-          [checkoutTime, 'Auto Checkout (4h grace)', metrics.delay_by_minutes, 
-           metrics.extra_time_minutes, metrics.total_working_hours_decimal, record.attendance_id]
-        );
-        
-        console.log(`[AUTO-CHECKOUT] ✅ Auto-checkout completed for ${record.employee_name} at ${checkoutTime}`);
-      }
-    }
-  } catch (error) {
-    console.error('[AUTO-CHECKOUT] Error:', error);
-  }
-}
-
-// Run auto-checkout every hour
-setInterval(autoCheckoutOverdueShifts, 60 * 60 * 1000);
-
 
 const upload = multer({
-  // Fallback to local `uploads/` if UPLOAD_PATH is not configured
   dest: process.env.UPLOAD_PATH || 'uploads/',
   limits: {
     fileSize: parseInt(process.env.MAX_FILE_SIZE || `${5 * 1024 * 1024}`, 10), // default 5MB
@@ -247,8 +177,11 @@ router.post('/mark', upload.single('image'), async (req, res) => {
     console.log(`[${requestId}] ✅ FACE MATCHED: ${bestMatch.employee_name} (${processingTime}ms)`);
 
     const { employee_id, employee_name, employee_type } = bestMatch;
-    // Convert client timestamp (ISO/UTC) into business local time for all
-    // shift-window and delay calculations.
+
+    // Record presence detection (for forgot checkout analysis)
+    await recordPresenceDetection(employee_id, timestampStr, date);
+
+    // Check presence requirement if enabled
     const checkInTime = toLocalTime(new Date(timestampStr));
     const shifts = await getAllShifts(employee_type);
     
@@ -256,107 +189,10 @@ router.post('/mark', upload.single('image'), async (req, res) => {
       return res.status(400).json({ message: 'No shift settings found for your employee type.' });
     }
 
-    const detectedShift = findShiftForPunchWithGrace(checkInTime, shifts) || detectShiftForTime(checkInTime, shifts);
-    const shift = detectedShift?.shift || shifts[0];
-
-    const incompleteRecord = await db.query(
-      `SELECT * FROM attendance_records 
-       WHERE employee_id = $1 AND attendance_date = $2 AND out_time IS NULL
-       ORDER BY in_time DESC LIMIT 1`,
-      [employee_id, date]
-    );
-
-    if (incompleteRecord.rows.length > 0) {
-      const record = incompleteRecord.rows[0];
-      const recordCheckInTime = new Date(record.in_time);
-      const checkOutTime = new Date(timestampStr);
-      
-      if (checkOutTime.getTime() <= recordCheckInTime.getTime()) {
-        return res.status(400).json({ 
-          message: 'Invalid checkout time. Check-out time must be after check-in time.',
-          check_in: record.in_time,
-          check_out: timestampStr
-        });
-      }
-      
-      // Normal checkout - no auto check-in to next shift
-      // Employee must manually check-in to next shift
-      const completedCount = await getCompletedCount(employee_id, date);
-      const isOTShift = completedCount > 0;
-      const metrics = await calculateAttendanceMetrics(record.in_time, timestampStr, employee_type, isOTShift);
-
-      // Get shift name for this record (reuse recordCheckInTime from above)
-      const recordDetectedShift = detectShiftForTime(recordCheckInTime, shifts);
-      const recordShift = recordDetectedShift?.shift || shifts[0];
-      const shiftName = recordShift.name || 'Unknown Shift';
-
-      const updatedRecord = await db.query(
-        `UPDATE attendance_records
-         SET out_time = $1::timestamp, location_out = $2, delay_by_minutes = $3,
-             extra_time_minutes = $4, total_working_hours_decimal = $5
-         WHERE attendance_id = $6
-         RETURNING total_working_hours_decimal`,
-        [timestampStr, location, metrics.delay_by_minutes, metrics.extra_time_minutes, 
-         metrics.total_working_hours_decimal, record.attendance_id]
-      );
-
-      // Get employee details for notification
-      const empDetails = await db.query(
-        `SELECT e.employee_code, e.email, e.phone_number, o.organization_name
-         FROM employee_details e
-         LEFT JOIN organizations o ON e.organization_id = o.organization_id
-         WHERE e.employee_id = $1`,
-        [employee_id]
-      );
-
-      // Trigger notifications (async, don't block response)
-      if (empDetails.rows.length > 0) {
-        const empData = empDetails.rows[0];
-        console.log(`[ATTENDANCE] 📧 Preparing to send notifications for ${employee_name} (checked_out)`);
-        console.log(`[ATTENDANCE] Employee email: ${empData.email || 'NOT SET'}`);
-       
-        // Format date/time for notification explicitly in IST (Asia/Kolkata)
-        const notificationDate = formatISTDate(timestampStr);
-        
-        triggerAttendanceNotifications('checked_out', {
-          employee_id,
-          employee_name,
-          employee_code: empData.employee_code || '',
-          organization_name: empData.organization_name || '',
-          date: notificationDate,
-          time: formatISTTime(timestampStr),
-          in_time: formatISTTime(record.in_time),
-          out_time: formatISTTime(timestampStr),
-          total_hours: updatedRecord.rows[0].total_working_hours_decimal,
-          status: 'checked_out',
-        }).catch(err => {
-          console.error('[ATTENDANCE] ❌ Notification trigger error:', err);
-        });
-      } else {
-        console.log(`[ATTENDANCE] ⚠️ No employee details found for ID: ${employee_id}`);
-      }
-
-      res.status(200).json({
-        status: 'checked_out',
-        employee_name,
-        out_time: timestampStr,
-        total_hours: updatedRecord.rows[0].total_working_hours_decimal,
-        is_ot: isOTShift,
-        ot_hours: metrics.ot_hours_decimal || 0,
-        shift_name: shiftName,
-        message: `Thank you ${employee_name}! You have checked out successfully from ${shiftName}.${isOTShift ? ' (OT Shift)' : ''}${metrics.ot_hours_decimal > 0 ? ` OT: ${metrics.ot_hours_decimal} hours` : ''}`
-      });
-    } else {
-      // Check-in allowed from (start - graceBefore) through end + graceAfter of the matched shift
-      const match = findShiftForPunchWithGrace(checkInTime, shifts);
-      const matchShift = match?.shift || null;
-      if (!matchShift) {
-        await recordPresenceDetection(employee_id, timestampStr, date);
-        return res.status(400).json({ message: 'Check-in not within any shift window.' });
-      }
-
-      await recordPresenceDetection(employee_id, timestampStr, date);
-      
+    const match = findShiftForPunchWithGrace(checkInTime, shifts);
+    const matchShift = match?.shift || null;
+    
+    if (matchShift) {
       const enforcePresence = (process.env.ENFORCE_PRESENCE || 'false').toLowerCase() === 'true';
       if (enforcePresence) {
         const presenceValid = await checkPresenceRequirement(
@@ -372,24 +208,20 @@ router.post('/mark', upload.single('image'), async (req, res) => {
           });
         }
       }
+    }
 
-      // Calculate delay at check-in so that late arrivals are visible on dashboards
-      let delayAtCheckInMinutes = 0;
-      try {
-        const shiftStart = buildLocalTime(checkInTime, matchShift.startHour, matchShift.startMinute);
-        if (checkInTime.getTime() > shiftStart.getTime()) {
-          delayAtCheckInMinutes = Math.round(
-            (checkInTime.getTime() - shiftStart.getTime()) / (1000 * 60)
-          );
-        }
-      } catch (err) {
-        console.error('Error calculating delay at check-in:', err);
+    // Use new punch handling service
+    try {
+      const punchResult = await handlePunch(employee_id, employee_type, timestampStr, date, location);
+
+      if (!punchResult.handled) {
+        // Duplicate punch or other reason
+        return res.status(200).json({
+          status: 'ignored',
+          message: punchResult.message || 'Punch ignored',
+          reason: punchResult.reason
+        });
       }
-
-      await db.query(
-        'INSERT INTO attendance_records (employee_id, attendance_date, in_time, location_in, delay_by_minutes) VALUES ($1, $2, $3::timestamp, $4, $5)',
-        [employee_id, date, timestampStr, location, delayAtCheckInMinutes]
-      );
 
       // Get employee details for notification
       const empDetails = await db.query(
@@ -400,15 +232,52 @@ router.post('/mark', upload.single('image'), async (req, res) => {
         [employee_id]
       );
 
-      // Trigger notifications (async, don't block response)
-      if (empDetails.rows.length > 0) {
-        const empData = empDetails.rows[0];
-        console.log(`[ATTENDANCE] 📧 Preparing to send notifications for ${employee_name} (checked_in)`);
-        console.log(`[ATTENDANCE] Employee email: ${empData.email || 'NOT SET'}`);
-       
-        // Format date/time for notification explicitly in IST (Asia/Kolkata)
-        const notificationDate = formatISTDate(timestampStr);
-        
+      const empData = empDetails.rows[0] || {};
+      const notificationDate = formatISTDate(timestampStr);
+
+      if (punchResult.type === 'OUT') {
+        // Check-out notification
+        const { rows: inTimeRows } = await db.query(
+          `SELECT in_time FROM attendance_records WHERE attendance_id = $1`,
+          [punchResult.attendance_id]
+        );
+        const inTime = inTimeRows[0]?.in_time;
+
+        triggerAttendanceNotifications('checked_out', {
+          employee_id,
+          employee_name,
+          employee_code: empData.employee_code || '',
+          organization_name: empData.organization_name || '',
+          date: notificationDate,
+          time: formatISTTime(timestampStr),
+          in_time: formatISTTime(inTime),
+          out_time: formatISTTime(timestampStr),
+          total_hours: punchResult.total_working_hours_decimal,
+          status: 'checked_out',
+        }).catch(err => {
+          console.error('[ATTENDANCE] ❌ Notification trigger error:', err);
+        });
+
+        // Warn if session is invalid
+        const attendanceConfig = require('../services/attendanceConfigService');
+        const warningMsg = !punchResult.is_valid_session
+          ? ` Note: Session too short (${punchResult.session_duration_minutes} min < ${attendanceConfig.MIN_SESSION_MIN} min) - not counted in working hours.`
+          : '';
+
+        res.status(200).json({
+          status: 'checked_out',
+          employee_name,
+          out_time: timestampStr,
+          total_hours: punchResult.total_working_hours_decimal,
+          is_ot: punchResult.is_ot,
+          ot_hours: punchResult.ot_hours_decimal || 0,
+          shift_name: punchResult.shift_name,
+          is_valid_session: punchResult.is_valid_session,
+          session_duration_minutes: punchResult.session_duration_minutes,
+          message: `Thank you ${employee_name}! You have checked out successfully from ${punchResult.shift_name}.${punchResult.is_ot ? ' (OT Shift)' : ''}${punchResult.ot_hours_decimal > 0 ? ` OT: ${punchResult.ot_hours_decimal} hours` : ''}${warningMsg}`
+        });
+      } else {
+        // Check-in notification
         triggerAttendanceNotifications('checked_in', {
           employee_id,
           employee_name,
@@ -421,23 +290,33 @@ router.post('/mark', upload.single('image'), async (req, res) => {
         }).catch(err => {
           console.error('[ATTENDANCE] ❌ Notification trigger error:', err);
         });
-      } else {
-        console.log(`[ATTENDANCE] ⚠️ No employee details found for ID: ${employee_id}`);
+
+        const checkInCompletedCount = await getCompletedCount(employee_id, date);
+        const isCheckInOT = checkInCompletedCount > 0;
+
+        res.status(201).json({
+          status: 'checked_in',
+          employee_name,
+          in_time: timestampStr,
+          is_ot: isCheckInOT,
+          shift_name: punchResult.shift_name,
+          delay_by_minutes: punchResult.delay_by_minutes,
+          message: `Hi ${employee_name}! You have checked in successfully to ${punchResult.shift_name}.${isCheckInOT ? ' (OT Shift)' : ''}${punchResult.delay_by_minutes > 0 ? ` (Late by ${punchResult.delay_by_minutes} minutes)` : ''}`
+        });
       }
-
-      // Get shift name for check-in
-      const checkInCompletedCount = await getCompletedCount(employee_id, date);
-      const isCheckInOT = checkInCompletedCount > 0;
-      const checkInShiftName = matchShift.name || 'Unknown Shift';
-
-      res.status(201).json({
-        status: 'checked_in',
-        employee_name,
-        in_time: timestampStr,
-        is_ot: isCheckInOT,
-        shift_name: checkInShiftName,
-        message: `Hi ${employee_name}! You have checked in successfully to ${checkInShiftName}.${isCheckInOT ? ' (OT Shift)' : ''}`
-      });
+    } catch (punchError) {
+      console.error(`[${requestId}] Error in punch handling:`, punchError);
+      
+      // If it's a validation error from punch handler, return it
+      if (punchError.message && (
+        punchError.message.includes('shift') ||
+        punchError.message.includes('Check-out') ||
+        punchError.message.includes('Check-in')
+      )) {
+        return res.status(400).json({ message: punchError.message });
+      }
+      
+      throw punchError; // Re-throw to be caught by outer catch
     }
   } catch (error) {
     console.error('Attendance marking error:', error);

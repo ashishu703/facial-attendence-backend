@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('../config/db');
 const { protect } = require('../middleware/authMiddleware');
 const { getAllShifts, buildLocalTime, buildShiftEndTime, calculateAttendanceMetrics, detectShiftForTime } = require('../services/attendanceLogicService');
+const { consolidateEmployeeDate } = require('../services/dailyConsolidationService');
 
 const router = express.Router();
 
@@ -139,41 +140,41 @@ router.get('/employee-attendance', protect, async (req, res) => {
     const { date } = req.query;
     const targetDate = date || new Date().toISOString().split('T')[0];
     
-    const { rows } = await db.query(
-      `WITH attendance_data AS (
-        SELECT 
-          e.employee_id,
-          e.employee_code,
-          e.employee_name,
-          e.employee_type,
-          o.organization_name,
-          ar.in_time,
-          ar.out_time,
-          ar.total_working_hours_decimal as total_hours,
-          -- Mark employee as OT only if any record for the day has OT hours > 0
-          CASE 
-            WHEN EXISTS (
-              SELECT 1 FROM attendance_records ar2 
-              WHERE ar2.employee_id = e.employee_id 
-                AND ar2.attendance_date = $1 
-                AND COALESCE(ar2.ot_hours_decimal, 0) > 0
-            ) THEN true
-            ELSE false
-          END as is_ot,
-          CASE 
-            WHEN ar.attendance_id IS NOT NULL THEN 'Present'
-            ELSE 'Absent'
-          END as status
-        FROM employee_details e
-        LEFT JOIN organizations o ON o.organization_id = e.organization_id
-        LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id AND ar.attendance_date = $1
-      )
-      SELECT * FROM attendance_data
-      ORDER BY organization_name, employee_name`,
-      [targetDate]
+    const { rows: employees } = await db.query(
+      `SELECT e.employee_id, e.employee_code, e.employee_name, 
+              e.employee_type, e.organization_id, o.organization_name
+       FROM employee_details e
+       LEFT JOIN organizations o ON o.organization_id = e.organization_id
+       ORDER BY o.organization_name, e.employee_name`
     );
+
+    // Consolidate attendance for each employee
+    const results = await Promise.all(employees.map(async (employee) => {
+      const consolidated = await consolidateEmployeeDate(employee.employee_id, targetDate);
+      
+      return {
+        employee_id: employee.employee_id,
+        employee_code: employee.employee_code || employee.employee_id,
+        employee_name: employee.employee_name,
+        employee_type: employee.employee_type,
+        organization_name: employee.organization_name || '',
+        in_time: consolidated.effective_in_time,
+        out_time: consolidated.effective_out_time,
+        total_hours: consolidated.total_work_hours,
+        is_ot: consolidated.ot_hours_decimal > 0,
+        status: consolidated.status // Full Day / Half Day / Short / Absent
+      };
+    }));
+
+    // Sort by organization and employee name
+    results.sort((a, b) => {
+      if (a.organization_name !== b.organization_name) {
+        return (a.organization_name || '').localeCompare(b.organization_name || '');
+      }
+      return (a.employee_name || '').localeCompare(b.employee_name || '');
+    });
     
-    res.json(rows);
+    res.json(results);
   } catch (error) {
     console.error('Error fetching employee attendance:', error);
     res.status(500).json({ message: 'Failed to fetch employee attendance' });
@@ -229,166 +230,138 @@ router.get('/attendance-trend', protect, async (req, res) => {
   }
 });
 
-// Get detailed attendance report with filters
 router.get('/detailed-report', protect, async (req, res) => {
   try {
     const { startDate, endDate, organizationId, employeeType, searchText } = req.query;
-    
-    let query = `
-      SELECT 
-        ar.attendance_id,
-        e.employee_code,
-        e.employee_name,
-        e.employee_type,
-        o.organization_name,
-        ar.attendance_date,
-        ar.in_time,
-        ar.out_time,
-        ar.delay_by_minutes,
-        ar.extra_time_minutes,
-        ar.total_working_hours_decimal,
-        COALESCE(ar.ot_hours_decimal, 0) as ot_hours_decimal,
-        ar.location_in,
-        ar.location_out,
-        ar.is_edited,
-        ar.edit_remark,
-        ar.edited_at,
-        CASE 
-          WHEN (
-            SELECT COUNT(*) FROM attendance_records ar2 
-            WHERE ar2.employee_id = e.employee_id 
-            AND ar2.attendance_date = ar.attendance_date 
-            AND ar2.out_time IS NOT NULL
-            AND ar2.attendance_id < ar.attendance_id
-          ) > 0 THEN true
-          ELSE false
-        END as is_ot,
-        COALESCE((
-          SELECT name FROM shift_settings 
-          WHERE employee_type = e.employee_type::text 
-          ORDER BY created_at DESC 
-          LIMIT 1
-        ), 'Unknown Shift') as shift_name
-      FROM attendance_records ar
-      JOIN employee_details e ON e.employee_id = ar.employee_id
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ message: 'startDate and endDate are required' });
+    }
+
+    // Generate date range
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const dates = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      dates.push(d.toISOString().split('T')[0]);
+    }
+
+    // Get all employees (including filters)
+    let employeeQuery = `
+      SELECT DISTINCT e.employee_id, e.employee_code, e.employee_name, 
+             e.employee_type, e.organization_id, o.organization_name
+      FROM employee_details e
       LEFT JOIN organizations o ON o.organization_id = e.organization_id
       WHERE 1=1
     `;
-    
-    const params = [];
-    let paramIndex = 1;
-    
-    if (startDate && endDate) {
-      query += ` AND ar.attendance_date BETWEEN $${paramIndex} AND $${paramIndex + 1}`;
-      params.push(startDate, endDate);
-      paramIndex += 2;
-    }
-    
+    const empParams = [];
+    let empParamIndex = 1;
+
     if (organizationId) {
-      query += ` AND e.organization_id = $${paramIndex}`;
-      params.push(organizationId);
-      paramIndex++;
+      employeeQuery += ` AND e.organization_id = $${empParamIndex}`;
+      empParams.push(organizationId);
+      empParamIndex++;
     }
-    
+
     if (employeeType) {
-      query += ` AND e.employee_type = $${paramIndex}`;
-      params.push(employeeType);
-      paramIndex++;
+      employeeQuery += ` AND e.employee_type = $${empParamIndex}`;
+      empParams.push(employeeType);
+      empParamIndex++;
     }
-    
+
     if (searchText) {
-      query += ` AND (e.employee_name ILIKE $${paramIndex} OR e.employee_code ILIKE $${paramIndex})`;
-      params.push(`%${searchText}%`);
-      paramIndex++;
+      employeeQuery += ` AND (e.employee_name ILIKE $${empParamIndex} OR e.employee_code ILIKE $${empParamIndex})`;
+      empParams.push(`%${searchText}%`);
+      empParamIndex++;
     }
-    
-    query += ` ORDER BY ar.attendance_date DESC, e.employee_name, ar.in_time ASC`;
-    
-    const { rows } = await db.query(query, params);
-    
-    // Recalculate metrics and add early checkout for each row
-    const processedRows = await Promise.all(rows.map(async (row) => {
-      let early_checkout_minutes = 0;
-      const dbOTHours = parseFloat(row.ot_hours_decimal) || 0;
-      
-      let recalculatedMetrics = {
-        delay_by_minutes: row.delay_by_minutes || 0,
-        extra_time_minutes: row.extra_time_minutes || 0,
-        total_working_hours_decimal: row.total_working_hours_decimal || 0,
-        ot_hours_decimal: dbOTHours
-      };
-      
-      if (row.out_time && row.in_time && row.employee_type) {
-        try {
-          const isOTShift = row.is_ot || false;
-          const metrics = await calculateAttendanceMetrics(row.in_time, row.out_time, row.employee_type, isOTShift);
-          
-          // Calculate regular shift hours and early checkout
-          const shifts = await getAllShifts(row.employee_type);
-          let regularShiftHours = 0;
-          
+
+    employeeQuery += ` ORDER BY e.employee_name`;
+
+    const { rows: employees } = await db.query(employeeQuery, empParams);
+
+    // Consolidate attendance for each employee for each date
+    const allResults = [];
+    const { consolidateEmployeeDate } = require('../services/dailyConsolidationService');
+
+    for (const employee of employees) {
+      for (const date of dates) {
+        const consolidated = await consolidateEmployeeDate(employee.employee_id, date);
+        
+        // Add employee details
+        const result = {
+          employee_id: employee.employee_id,
+          employee_code: employee.employee_code || employee.employee_id,
+          employee_name: employee.employee_name,
+          employee_type: employee.employee_type,
+          organization_name: employee.organization_name || '',
+          attendance_date: date,
+          in_time: consolidated.effective_in_time,
+          out_time: consolidated.effective_out_time,
+          delay_by_minutes: consolidated.delay_by_minutes,
+          extra_time_minutes: consolidated.extra_time_minutes,
+          total_working_hours_decimal: consolidated.total_work_hours,
+          ot_hours_decimal: consolidated.ot_hours_decimal,
+          status: consolidated.status, // Full Day / Half Day / Short / Absent
+          missing_punch: consolidated.missing_punch,
+          is_ot: consolidated.ot_hours_decimal > 0,
+          shift_name: null, // Will be set below
+          location_in: null,
+          location_out: null,
+          is_edited: false,
+          edit_remark: null,
+          edited_at: null
+        };
+
+        // Get shift name
+        if (employee.employee_type) {
+          const shifts = await getAllShifts(employee.employee_type);
           if (shifts.length > 0) {
-            const inTime = new Date(row.in_time);
-            const outTime = new Date(row.out_time);
-            const detectedShiftResult = detectShiftForTime(inTime, shifts);
-            const shift = detectedShiftResult?.shift || shifts[0];
-            const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
-            const shiftEndTime = buildShiftEndTime(inTime, shift);
-            
-            // Regular shift hours calculation:
-            // - If checkout >= shift end: regularShiftHours = shift end - shift start
-            // - If checkout < shift end: regularShiftHours = checkout - shift start
-            if (outTime.getTime() >= shiftEndTime.getTime()) {
-              // Checkout is at or after shift end: regular hours = full shift duration
-              regularShiftHours = Math.max(0, parseFloat(((shiftEndTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
+            if (consolidated.effective_in_time) {
+              const inTime = new Date(consolidated.effective_in_time);
+              const detectedShift = detectShiftForTime(inTime, shifts);
+              result.shift_name = detectedShift?.shift?.name || shifts[0].name || 'Unknown Shift';
             } else {
-              // Early checkout: regular hours = actual worked hours
-              regularShiftHours = Math.max(0, parseFloat(((outTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
-              early_checkout_minutes = Math.round((shiftEndTime.getTime() - outTime.getTime()) / (1000 * 60));
+              result.shift_name = shifts[0].name || 'Unknown Shift';
             }
           }
-          
-          // Determine OT hours: use DB value if exists (manually set), otherwise use calculated
-          const finalOTHours = dbOTHours > 0 ? dbOTHours : (metrics.ot_hours_decimal || 0);
-          
-          // Total hours calculation:
-          // - If manual OT is set: Total = Actual Worked Hours (checkout - checkin) + Manual OT
-          // - If auto-calculated OT exists: Total = Regular Shift Hours + Auto OT
-          // - If no OT: Total = Actual Worked Hours (checkout - checkin)
-          let finalTotalHours;
-          if (dbOTHours > 0) {
-            // Manual OT: Add to actual worked hours
-            finalTotalHours = Math.max(0, parseFloat((metrics.total_working_hours_decimal + dbOTHours).toFixed(2)));
-          } else if (finalOTHours > 0) {
-            // Auto-calculated OT: Add to regular shift hours
-            finalTotalHours = Math.max(0, parseFloat((regularShiftHours + finalOTHours).toFixed(2)));
-          } else {
-            // No OT: Use actual worked hours
-            finalTotalHours = metrics.total_working_hours_decimal;
-          }
-          
-          recalculatedMetrics = {
-            delay_by_minutes: metrics.delay_by_minutes,
-            extra_time_minutes: metrics.extra_time_minutes,
-            total_working_hours_decimal: finalTotalHours,
-            ot_hours_decimal: finalOTHours
-          };
-        } catch (err) {
-          console.error('Error recalculating metrics:', err);
         }
+
+        // Get location from first valid session if exists
+        if (consolidated.effective_in_time) {
+          const { rows: locationRows } = await db.query(
+            `SELECT location_in, location_out 
+             FROM attendance_records 
+             WHERE employee_id = $1 
+               AND attendance_date = $2 
+               AND in_time IS NOT NULL
+             ORDER BY in_time ASC 
+             LIMIT 1`,
+            [employee.employee_id, date]
+          );
+          if (locationRows.length > 0) {
+            result.location_in = locationRows[0].location_in;
+            result.location_out = locationRows[0].location_out;
+          }
+        }
+
+        // Only include if there's attendance data OR if filtering requires showing absent
+        // For now, include all (present + absent)
+        allResults.push(result);
       }
-      
-      return {
-        ...row,
-        delay_by_minutes: recalculatedMetrics.delay_by_minutes,
-        extra_time_minutes: recalculatedMetrics.extra_time_minutes,
-        total_working_hours_decimal: recalculatedMetrics.total_working_hours_decimal,
-        ot_hours_decimal: recalculatedMetrics.ot_hours_decimal || 0,
-        early_checkout_minutes: Math.max(0, early_checkout_minutes)
-      };
-    }));
-    
-    res.json(processedRows);
+    }
+
+    // Sort results
+    allResults.sort((a, b) => {
+      if (a.attendance_date !== b.attendance_date) {
+        return b.attendance_date.localeCompare(a.attendance_date);
+      }
+      if (a.organization_name !== b.organization_name) {
+        return (a.organization_name || '').localeCompare(b.organization_name || '');
+      }
+      return (a.employee_name || '').localeCompare(b.employee_name || '');
+    });
+
+    res.json(allResults);
   } catch (error) {
     console.error('Error fetching detailed report:', error);
     console.error('Error details:', error.message);

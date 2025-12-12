@@ -72,6 +72,31 @@ class DailyConsolidationService {
       if (validSessions.length === 0) {
         // Has records but no valid sessions
         const hasIncompleteSession = records.some(r => r.in_time && !r.out_time);
+        const hasCheckIn = records.some(r => r.in_time);
+        
+        // If employee has check-in but no checkout, it's "Missing Punch", not "Absent"
+        let status = 'Absent';
+        if (hasCheckIn) {
+          status = 'Missing Punch'; // Employee checked in but forgot to checkout
+        }
+        
+        // Calculate delay if check-in exists
+        let delayByMinutes = 0;
+        if (hasCheckIn && records[0]?.in_time) {
+          const inTime = new Date(records[0].in_time);
+          const employeeType = records[0].employee_type;
+          const shifts = await getAllShifts(employeeType);
+          
+          if (shifts.length > 0) {
+            const detectedShift = detectShiftForTime(inTime, shifts);
+            const shift = detectedShift?.shift || shifts[0];
+            const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
+            
+            if (inTime.getTime() > shiftStartTime.getTime()) {
+              delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
+            }
+          }
+        }
         
         return {
           employee_id: employeeId,
@@ -79,10 +104,10 @@ class DailyConsolidationService {
           effective_in_time: records[0]?.in_time || null,
           effective_out_time: null,
           total_work_hours: 0,
-          delay_by_minutes: 0,
+          delay_by_minutes: delayByMinutes,
           extra_time_minutes: 0,
           ot_hours_decimal: 0,
-          status: 'Absent',
+          status: status,
           missing_punch: hasIncompleteSession,
           valid_sessions_count: 0
         };
@@ -146,19 +171,23 @@ class DailyConsolidationService {
       // Calculate OT hours (from total OT minutes)
       const otHoursDecimal = parseFloat((totalOTMinutes / 60).toFixed(2));
 
+      // Check for missing punch first
+      const hasIncompleteSession = records.some(r => r.in_time && !r.out_time);
+      const hasCheckIn = records.some(r => r.in_time);
+      const missingPunch = hasIncompleteSession && validSessions.length === 0;
+
       // Determine status
       let status = 'Absent';
-      if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
+      if (hasCheckIn && !effectiveOutTime) {
+        // Employee checked in but didn't checkout - Missing Punch
+        status = 'Missing Punch';
+      } else if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
         status = 'Full Day';
       } else if (totalWorkHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
         status = 'Half Day';
       } else if (totalWorkHours > 0) {
         status = 'Short';
       }
-
-      // Check for missing punch
-      const hasIncompleteSession = records.some(r => r.in_time && !r.out_time);
-      const missingPunch = hasIncompleteSession && validSessions.length === 0;
 
       return {
         employee_id: employeeId,

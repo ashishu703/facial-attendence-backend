@@ -8,6 +8,7 @@ const {
   buildLocalTime,
   buildShiftEndTime
 } = require('../services/attendanceLogicService');
+const { consolidateDate, consolidateEmployeeDate } = require('../services/dailyConsolidationService');
 const { protect } = require('../middleware/authMiddleware');
 
 const router = express.Router();
@@ -145,108 +146,100 @@ async function recalculateAndUpdateAttendanceRecord(
   return metrics;
 }
 
+/**
+ * Fetch consolidated attendance rows (one row per employee per day)
+ * Uses daily consolidation service to ensure accurate metrics
+ */
 async function fetchAttendanceRows(startDate, endDate) {
   await ensureEditColumns();
   
-  let query = `SELECT COALESCE(d.employee_code, d.employee_id::text) AS employee_code,
-    d.employee_name, d.employee_type, r.attendance_date, r.in_time::text AS in_time,
-    CASE WHEN r.out_time IS NOT NULL THEN r.out_time::text ELSE NULL END AS out_time,
-    r.delay_by_minutes, r.extra_time_minutes, r.total_working_hours_decimal,
-    COALESCE(r.ot_hours_decimal, 0) as ot_hours_decimal,
-    r.location_in, r.location_out, r.attendance_id, r.employee_id
-    FROM attendance_records r JOIN employee_details d ON r.employee_id = d.employee_id`;
-  const params = [];
-  if (startDate && endDate) {
-    params.push(startDate, endDate);
-    query += ' WHERE r.attendance_date BETWEEN $1 AND $2';
+  if (!startDate || !endDate) {
+    return [];
   }
-  query += ' ORDER BY r.attendance_date DESC, d.employee_name, r.in_time ASC';
-  const { rows } = await db.query(query, params);
-  
-  const employeeDateMap = {};
-  rows.forEach(row => {
-    const key = `${row.employee_id}_${row.attendance_date}`;
-    if (!employeeDateMap[key]) employeeDateMap[key] = [];
-    employeeDateMap[key].push(row);
-  });
-  
-  const processedRows = await Promise.all(rows.map(async (row) => {
-    const key = `${row.employee_id}_${row.attendance_date}`;
-    const recordsForDay = employeeDateMap[key];
-    const currentRecordIndex = recordsForDay.findIndex(r => r.attendance_id === row.attendance_id);
-    const isOTShift = currentRecordIndex > 0 && row.out_time !== null;
-    
-    const dbOTHours = parseFloat(row.ot_hours_decimal) || 0;
-    
-    let metrics = {
-      delay_by_minutes: row.delay_by_minutes || 0,
-      extra_time_minutes: row.extra_time_minutes || 0,
-      total_working_hours_decimal: row.total_working_hours_decimal || 0,
-      ot_hours_decimal: dbOTHours
-    };
-    
-    if (row.out_time && row.in_time && row.employee_type) {
-      const recalculated = await calculateAttendanceMetrics(row.in_time, row.out_time, row.employee_type, isOTShift);
+
+  // Generate date range
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const dates = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    dates.push(d.toISOString().split('T')[0]);
+  }
+
+  // Get all employees (to include absent ones too)
+  const { rows: employees } = await db.query(
+    `SELECT DISTINCT e.employee_id, 
+            COALESCE(e.employee_code, e.employee_id::text) AS employee_code, 
+            e.employee_name, 
+            e.employee_type
+     FROM employee_details e
+     ORDER BY e.employee_name`
+  );
+
+  // Consolidate for each employee for each date
+  const { consolidateEmployeeDate } = require('../services/dailyConsolidationService');
+  const allRows = [];
+
+  for (const employee of employees) {
+    for (const date of dates) {
+      const consolidated = await consolidateEmployeeDate(employee.employee_id, date);
       
-      // Calculate regular shift hours
-      const shifts = await getAllShifts(row.employee_type);
-      let regularShiftHours = 0;
-      
-      if (shifts.length > 0) {
-        const inTime = new Date(row.in_time);
-        const outTime = new Date(row.out_time);
-        const detectedShift = detectShiftForTime(inTime, shifts);
-        const shift = detectedShift?.shift || shifts[0];
-        const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
-        const shiftEndTime = buildShiftEndTime(inTime, shift);
-        
-        // Regular shift hours calculation:
-        // - If checkout >= shift end: regularShiftHours = shift end - shift start
-        // - If checkout < shift end: regularShiftHours = checkout - shift start
-        if (outTime.getTime() >= shiftEndTime.getTime()) {
-          regularShiftHours = Math.max(0, parseFloat(((shiftEndTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
-        } else {
-          regularShiftHours = Math.max(0, parseFloat(((outTime.getTime() - shiftStartTime.getTime()) / (1000 * 60 * 60)).toFixed(2)));
+      // Get location from first valid session
+      let locationIn = null;
+      let locationOut = null;
+      if (consolidated.effective_in_time) {
+        const { rows: locRows } = await db.query(
+          `SELECT location_in, location_out 
+           FROM attendance_records 
+           WHERE employee_id = $1 AND attendance_date = $2 AND in_time IS NOT NULL
+           ORDER BY in_time ASC LIMIT 1`,
+          [employee.employee_id, date]
+        );
+        if (locRows.length > 0) {
+          locationIn = locRows[0].location_in;
+          locationOut = locRows[0].location_out;
         }
       }
-      
-      // Use DB OT if exists (manually set), otherwise use calculated
-      const finalOTHours = dbOTHours > 0 ? dbOTHours : (recalculated.ot_hours_decimal || 0);
-      
-      // Total hours calculation:
-      // - If manual OT is set: Total = Actual Worked Hours (checkout - checkin) + Manual OT
-      // - If auto-calculated OT exists: Total = Regular Shift Hours + Auto OT
-      // - If no OT: Total = Actual Worked Hours (checkout - checkin)
-      let finalTotalHours;
-      if (dbOTHours > 0) {
-        // Manual OT: Add to actual worked hours
-        finalTotalHours = Math.max(0, parseFloat((recalculated.total_working_hours_decimal + dbOTHours).toFixed(2)));
-      } else if (finalOTHours > 0) {
-        // Auto-calculated OT: Add to regular shift hours
-        finalTotalHours = Math.max(0, parseFloat((regularShiftHours + finalOTHours).toFixed(2)));
-      } else {
-        // No OT: Use actual worked hours
-        finalTotalHours = recalculated.total_working_hours_decimal;
+
+      // Get shift name
+      let shiftName = 'Unknown Shift';
+      if (employee.employee_type && consolidated.effective_in_time) {
+        const shifts = await getAllShifts(employee.employee_type);
+        if (shifts.length > 0) {
+          const inTime = new Date(consolidated.effective_in_time);
+          const detectedShift = detectShiftForTime(inTime, shifts);
+          shiftName = detectedShift?.shift?.name || shifts[0].name || 'Unknown Shift';
+        }
       }
-      
-      metrics = {
-        delay_by_minutes: recalculated.delay_by_minutes,
-        extra_time_minutes: recalculated.extra_time_minutes,
-        total_working_hours_decimal: finalTotalHours,
-        ot_hours_decimal: finalOTHours
-      };
+
+      allRows.push({
+        employee_code: employee.employee_code || employee.employee_id,
+        employee_name: employee.employee_name,
+        employee_type: employee.employee_type,
+        attendance_date: date,
+        in_time: consolidated.effective_in_time,
+        out_time: consolidated.effective_out_time,
+        delay_by_minutes: consolidated.delay_by_minutes,
+        extra_time_minutes: consolidated.extra_time_minutes,
+        total_working_hours_decimal: consolidated.total_work_hours,
+        ot_hours_decimal: consolidated.ot_hours_decimal,
+        location_in: locationIn,
+        location_out: locationOut,
+        is_ot: consolidated.ot_hours_decimal > 0,
+        status: consolidated.status,
+        missing_punch: consolidated.missing_punch
+      });
     }
-    
-    return {
-      ...row,
-      in_time: row.in_time ? new Date(row.in_time).toISOString() : null,
-      out_time: row.out_time ? new Date(row.out_time).toISOString() : null,
-      ...metrics,
-      is_ot: isOTShift
-    };
-  }));
-  
-  return processedRows;
+  }
+
+  // Sort by date (desc), then employee name
+  allRows.sort((a, b) => {
+    if (a.attendance_date !== b.attendance_date) {
+      return b.attendance_date.localeCompare(a.attendance_date);
+    }
+    return (a.employee_name || '').localeCompare(b.employee_name || '');
+  });
+
+  return allRows;
 }
 
 // ========== Admin APIs for manual edit/delete (used by ViewReports) ==========
@@ -438,6 +431,84 @@ router.delete('/:id', protect, async (req, res) => {
   }
 });
 
+/**
+ * Consolidated Daily Report
+ * Returns one row per employee per day with effective IN/OUT and status
+ */
+router.get('/consolidated-report', protect, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        message: 'startDate and endDate are required (format: YYYY-MM-DD)' 
+      });
+    }
+
+    // Generate date range
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const dates = [];
+    
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      dates.push(d.toISOString().split('T')[0]);
+    }
+
+    // Consolidate for each date
+    const allResults = [];
+    for (const date of dates) {
+      const consolidated = await consolidateDate(date);
+      allResults.push(...consolidated);
+    }
+
+    // Join with employee details for complete report
+    const employeeIds = [...new Set(allResults.map(r => r.employee_id))];
+    const { rows: employees } = await db.query(
+      `SELECT employee_id, employee_name, employee_code, employee_type, organization_id
+       FROM employee_details
+       WHERE employee_id = ANY($1::uuid[])`,
+      [employeeIds]
+    );
+
+    const employeeMap = new Map(employees.map(e => [e.employee_id, e]));
+
+    // Get organization names
+    const orgIds = [...new Set(employees.map(e => e.organization_id).filter(Boolean))];
+    const { rows: orgs } = orgIds.length > 0 ? await db.query(
+      `SELECT organization_id, organization_name FROM organizations WHERE organization_id = ANY($1::int[])`,
+      [orgIds]
+    ) : { rows: [] };
+    const orgMap = new Map(orgs.map(o => [o.organization_id, o.organization_name]));
+
+    // Build final report
+    const report = allResults.map(result => {
+      const emp = employeeMap.get(result.employee_id) || {};
+      return {
+        employee_id: result.employee_id,
+        employee_code: emp.employee_code || result.employee_id,
+        employee_name: emp.employee_name || 'Unknown',
+        employee_type: emp.employee_type || 'Unknown',
+        organization_name: emp.organization_id ? (orgMap.get(emp.organization_id) || '') : '',
+        attendance_date: result.attendance_date,
+        effective_in_time: result.effective_in_time,
+        effective_out_time: result.effective_out_time,
+        total_work_hours: result.total_work_hours,
+        delay_by_minutes: result.delay_by_minutes,
+        extra_time_minutes: result.extra_time_minutes,
+        ot_hours_decimal: result.ot_hours_decimal,
+        status: result.status,
+        missing_punch: result.missing_punch,
+        valid_sessions_count: result.valid_sessions_count
+      };
+    });
+
+    res.json(report);
+  } catch (error) {
+    console.error('Consolidated report error:', error);
+    res.status(500).json({ message: 'Server error fetching consolidated report.' });
+  }
+});
+
 router.get('/report', protect, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
@@ -446,6 +517,122 @@ router.get('/report', protect, async (req, res) => {
   } catch (error) {
     console.error('Report error:', error);
     res.status(500).json({ message: 'Server error fetching report.' });
+  }
+});
+
+/**
+ * Download Consolidated Report as Excel
+ */
+router.get('/download-consolidated-excel', protect, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ 
+        message: 'startDate and endDate are required (format: YYYY-MM-DD)' 
+      });
+    }
+
+    // Generate date range
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const dates = [];
+    
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      dates.push(d.toISOString().split('T')[0]);
+    }
+
+    // Consolidate for each date
+    const allResults = [];
+    for (const date of dates) {
+      const consolidated = await consolidateDate(date);
+      allResults.push(...consolidated);
+    }
+
+    // Join with employee details
+    const employeeIds = [...new Set(allResults.map(r => r.employee_id))];
+    const { rows: employees } = await db.query(
+      `SELECT employee_id, employee_name, employee_code, employee_type, organization_id
+       FROM employee_details
+       WHERE employee_id = ANY($1::uuid[])`,
+      [employeeIds]
+    );
+
+    const employeeMap = new Map(employees.map(e => [e.employee_id, e]));
+
+    const orgIds = [...new Set(employees.map(e => e.organization_id).filter(Boolean))];
+    const { rows: orgs } = orgIds.length > 0 ? await db.query(
+      `SELECT organization_id, organization_name FROM organizations WHERE organization_id = ANY($1::int[])`,
+      [orgIds]
+    ) : { rows: [] };
+    const orgMap = new Map(orgs.map(o => [o.organization_id, o.organization_name]));
+
+    // Build report data
+    const reportData = allResults.map(result => {
+      const emp = employeeMap.get(result.employee_id) || {};
+      return {
+        employee_code: emp.employee_code || result.employee_id,
+        employee_name: emp.employee_name || 'Unknown',
+        employee_type: emp.employee_type || 'Unknown',
+        organization_name: emp.organization_id ? (orgMap.get(emp.organization_id) || '') : '',
+        attendance_date: new Date(result.attendance_date),
+        effective_in_time: result.effective_in_time ? new Date(result.effective_in_time) : null,
+        effective_out_time: result.effective_out_time ? new Date(result.effective_out_time) : null,
+        total_work_hours: result.total_work_hours,
+        delay_by_minutes: result.delay_by_minutes,
+        extra_time_minutes: result.extra_time_minutes,
+        ot_hours_decimal: result.ot_hours_decimal,
+        status: result.status,
+        missing_punch: result.missing_punch ? 'Yes' : 'No',
+        valid_sessions_count: result.valid_sessions_count
+      };
+    });
+
+    // Create Excel workbook
+    const workbook = new exceljs.Workbook();
+    const worksheet = workbook.addWorksheet('Consolidated Attendance Report');
+
+    worksheet.columns = [
+      { header: 'Employee Code', key: 'employee_code', width: 16 },
+      { header: 'Employee Name', key: 'employee_name', width: 20 },
+      { header: 'Employee Type', key: 'employee_type', width: 15 },
+      { header: 'Organization', key: 'organization_name', width: 20 },
+      { header: 'Attendance Date', key: 'attendance_date', width: 15 },
+      { header: 'Effective In Time', key: 'effective_in_time', width: 20 },
+      { header: 'Effective Out Time', key: 'effective_out_time', width: 20 },
+      { header: 'Total Hours', key: 'total_work_hours', width: 12 },
+      { header: 'Delay (minutes)', key: 'delay_by_minutes', width: 15 },
+      { header: 'Extra Time (minutes)', key: 'extra_time_minutes', width: 18 },
+      { header: 'OT Hours', key: 'ot_hours_decimal', width: 12 },
+      { header: 'Status', key: 'status', width: 12 },
+      { header: 'Missing Punch', key: 'missing_punch', width: 12 },
+      { header: 'Valid Sessions', key: 'valid_sessions_count', width: 12 },
+    ];
+
+    worksheet.addRows(reportData);
+
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE0E0E0' },
+    };
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="consolidated_attendance_report_${startDate}_to_${endDate}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (error) {
+    console.error('Consolidated Excel download error:', error);
+    res.status(500).json({ message: 'Server error during Excel download.' });
   }
 });
 

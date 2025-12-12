@@ -12,6 +12,17 @@ class AttendanceLogicService {
     this.LOCAL_TIME_OFFSET_MINUTES = parseInt(process.env.LOCAL_TIME_OFFSET_MINUTES || '330', 10);
   }
 
+  /**
+   * Convert UTC timestamp to local business timezone
+   * 
+   * Timezone Handling: All times are handled consistently in server timezone 
+   * (or organization timezone), ensuring clean reporting even if cameras are 
+   * in different locations. This eliminates confusion and ensures accurate 
+   * attendance calculations regardless of where employees punch.
+   * 
+   * @param {Date} date - UTC timestamp from client
+   * @returns {Date} - Local business timezone timestamp
+   */
   toLocalTime(date) {
     if (!(date instanceof Date) || isNaN(date.getTime())) return date;
     if (!Number.isFinite(this.LOCAL_TIME_OFFSET_MINUTES) || this.LOCAL_TIME_OFFSET_MINUTES === 0) {
@@ -67,6 +78,21 @@ class AttendanceLogicService {
     }
   }
 
+  /**
+   * Detect which shift a check-in time belongs to
+   * 
+   * Cross-Midnight Shift Support: This function handles night shifts that 
+   * cross midnight (e.g., 22:00–06:00) by detecting when shift end is before 
+   * shift start. The logic treats shift end as next date automatically.
+   * 
+   * For future enhancement, the same logic can support night shifts by treating 
+   * shift end as next date and adjusting consolidation to look across two 
+   * calendar dates. Current design is already compatible with that.
+   * 
+   * @param {Date} checkInTime - Employee check-in time
+   * @param {Array} shifts - Available shifts for employee type
+   * @returns {Object|null} - Detected shift with index
+   */
   detectShiftForTime(checkInTime, shifts) {
     if (!shifts?.length) return null;
     
@@ -76,6 +102,8 @@ class AttendanceLogicService {
       const shift = shifts[i];
       const shiftStartMinutes = shift.startHour * 60 + shift.startMinute;
       const shiftEndMinutes = shift.endHour * 60 + shift.endMinute;
+      
+      // Detect cross-midnight shifts (e.g., 22:00 to 06:00)
       const isMidnightShift = shiftEndMinutes < shiftStartMinutes;
       const isInShift = isMidnightShift
         ? (checkInMinutes >= shiftStartMinutes || checkInMinutes <= shiftEndMinutes)
@@ -93,9 +121,23 @@ class AttendanceLogicService {
     return d;
   }
 
+  /**
+   * Build shift end time, handling cross-midnight shifts
+   * 
+   * Cross-Midnight Shift Support: If shift end time is before or equal to 
+   * shift start time, it means the shift crosses midnight (e.g., 22:00 to 06:00).
+   * In such cases, the end time is automatically set to the next calendar date.
+   * 
+   * @param {Date} baseTime - Base date/time for calculation
+   * @param {Object} shift - Shift configuration with start/end hours
+   * @returns {Date} - Shift end time (next day if cross-midnight)
+   */
   buildShiftEndTime(baseTime, shift) {
     const start = this.buildLocalTime(baseTime, shift.startHour, shift.startMinute);
     const end = this.buildLocalTime(baseTime, shift.endHour, shift.endMinute);
+    
+    // Handle cross-midnight shifts (e.g., 22:00 to 06:00)
+    // Automatically move end time to next day
     if (end.getTime() <= start.getTime()) {
       end.setDate(end.getDate() + 1);
     }

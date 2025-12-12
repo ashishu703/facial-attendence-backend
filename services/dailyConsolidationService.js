@@ -70,45 +70,116 @@ class DailyConsolidationService {
       );
 
       if (validSessions.length === 0) {
-        // Has records but no valid sessions
+        // Has records but no valid sessions (check-in but no checkout)
         const hasIncompleteSession = records.some(r => r.in_time && !r.out_time);
         const hasCheckIn = records.some(r => r.in_time);
         
-        // If employee has check-in but no checkout, it's "Missing Punch", not "Absent"
-        let status = 'Absent';
-        if (hasCheckIn) {
-          status = 'Missing Punch'; // Employee checked in but forgot to checkout
+        // If no check-in at all, employee is absent
+        if (!hasCheckIn) {
+          return {
+            employee_id: employeeId,
+            attendance_date: date,
+            effective_in_time: null,
+            effective_out_time: null,
+            total_work_hours: 0,
+            delay_by_minutes: 0,
+            extra_time_minutes: 0,
+            ot_hours_decimal: 0,
+            status: 'Absent',
+            missing_punch: false,
+            valid_sessions_count: 0
+          };
         }
         
-        // Calculate delay if check-in exists
+        // Employee has check-in but no checkout - calculate partial hours
+        const firstCheckIn = records.find(r => r.in_time)?.in_time;
+        if (!firstCheckIn) {
+          return {
+            employee_id: employeeId,
+            attendance_date: date,
+            effective_in_time: null,
+            effective_out_time: null,
+            total_work_hours: 0,
+            delay_by_minutes: 0,
+            extra_time_minutes: 0,
+            ot_hours_decimal: 0,
+            status: 'Absent',
+            missing_punch: false,
+            valid_sessions_count: 0
+          };
+        }
+        
+        const inTime = new Date(firstCheckIn);
+        const employeeType = records[0].employee_type;
+        const shifts = await getAllShifts(employeeType);
+        
+        // Calculate delay
         let delayByMinutes = 0;
-        if (hasCheckIn && records[0]?.in_time) {
-          const inTime = new Date(records[0].in_time);
-          const employeeType = records[0].employee_type;
-          const shifts = await getAllShifts(employeeType);
+        let shiftEndTime = null;
+        let currentTime = new Date();
+        let partialHours = 0;
+        let status = 'Short';
+        
+        if (shifts.length > 0) {
+          const detectedShift = detectShiftForTime(inTime, shifts);
+          const shift = detectedShift?.shift || shifts[0];
+          const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
+          shiftEndTime = buildShiftEndTime(inTime, shift);
           
-          if (shifts.length > 0) {
-            const detectedShift = detectShiftForTime(inTime, shifts);
-            const shift = detectedShift?.shift || shifts[0];
-            const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
-            
-            if (inTime.getTime() > shiftStartTime.getTime()) {
-              delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
-            }
+          // Calculate delay
+          if (inTime.getTime() > shiftStartTime.getTime()) {
+            delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
+          }
+          
+          // Calculate partial hours: from check-in to now (or shift end, whichever is earlier)
+          // This gives us hours worked so far
+          const endTimeForCalculation = currentTime.getTime() < shiftEndTime.getTime() 
+            ? currentTime 
+            : shiftEndTime;
+          
+          partialHours = Math.max(0, (endTimeForCalculation.getTime() - inTime.getTime()) / (1000 * 60 * 60));
+          partialHours = Math.min(partialHours, this.config.MAX_DAY_DURATION_HOURS);
+          
+          // Determine status based on partial hours
+          if (partialHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
+            status = 'Full Day';
+          } else if (partialHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
+            status = 'Half Day';
+          } else if (partialHours > 0) {
+            status = 'Short';
+          }
+          
+          // Only mark as "Missing Punch" if shift has ended and they forgot checkout
+          const now = new Date();
+          if (now.getTime() > shiftEndTime.getTime()) {
+            // Shift has ended - they forgot to checkout
+            status = 'Missing Punch';
+          }
+        } else {
+          // No shift settings - calculate from check-in to now
+          partialHours = Math.max(0, (currentTime.getTime() - inTime.getTime()) / (1000 * 60 * 60));
+          partialHours = Math.min(partialHours, this.config.MAX_DAY_DURATION_HOURS);
+          
+          if (partialHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
+            status = 'Full Day';
+          } else if (partialHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
+            status = 'Half Day';
+          } else if (partialHours > 0) {
+            status = 'Short';
           }
         }
         
         return {
           employee_id: employeeId,
           attendance_date: date,
-          effective_in_time: records[0]?.in_time || null,
+          effective_in_time: firstCheckIn,
           effective_out_time: null,
-          total_work_hours: 0,
+          total_work_hours: parseFloat(partialHours.toFixed(2)),
           delay_by_minutes: delayByMinutes,
           extra_time_minutes: 0,
           ot_hours_decimal: 0,
           status: status,
-          missing_punch: hasIncompleteSession,
+          missing_punch: hasIncompleteSession && shiftEndTime && new Date().getTime() > shiftEndTime.getTime(),
           valid_sessions_count: 0
         };
       }
@@ -171,22 +242,53 @@ class DailyConsolidationService {
       // Calculate OT hours (from total OT minutes)
       const otHoursDecimal = parseFloat((totalOTMinutes / 60).toFixed(2));
 
-      // Check for missing punch first
+      // Check for missing punch (only if shift has ended and checkout is missing)
       const hasIncompleteSession = records.some(r => r.in_time && !r.out_time);
-      const hasCheckIn = records.some(r => r.in_time);
-      const missingPunch = hasIncompleteSession && validSessions.length === 0;
+      let missingPunch = false;
+      
+      // Only mark as missing punch if shift has ended and checkout is missing
+      if (hasIncompleteSession && effectiveInTime) {
+        const employeeType = validSessions[0]?.employee_type || records[0]?.employee_type;
+        const shifts = await getAllShifts(employeeType);
+        if (shifts.length > 0) {
+          const inTime = new Date(effectiveInTime);
+          const detectedShift = detectShiftForTime(inTime, shifts);
+          const shift = detectedShift?.shift || shifts[0];
+          const shiftEndTime = buildShiftEndTime(inTime, shift);
+          const now = new Date();
+          
+          // Missing punch only if shift has ended and checkout is still missing
+          missingPunch = now.getTime() > shiftEndTime.getTime() && !effectiveOutTime;
+        }
+      }
 
-      // Determine status
+      // Determine status based on total work hours
       let status = 'Absent';
-      if (hasCheckIn && !effectiveOutTime) {
-        // Employee checked in but didn't checkout - Missing Punch
-        status = 'Missing Punch';
-      } else if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
+      if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
         status = 'Full Day';
       } else if (totalWorkHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
         status = 'Half Day';
       } else if (totalWorkHours > 0) {
         status = 'Short';
+      } else if (effectiveInTime && !effectiveOutTime) {
+        // Has check-in but no checkout - check if shift ended
+        const employeeType = validSessions[0]?.employee_type || records[0]?.employee_type;
+        const shifts = await getAllShifts(employeeType);
+        if (shifts.length > 0) {
+          const inTime = new Date(effectiveInTime);
+          const detectedShift = detectShiftForTime(inTime, shifts);
+          const shift = detectedShift?.shift || shifts[0];
+          const shiftEndTime = buildShiftEndTime(inTime, shift);
+          const now = new Date();
+          
+          if (now.getTime() > shiftEndTime.getTime()) {
+            status = 'Missing Punch'; // Shift ended, forgot checkout
+          } else {
+            status = 'Short'; // Still working, show partial status
+          }
+        } else {
+          status = 'Short'; // No shift settings, show partial
+        }
       }
 
       return {

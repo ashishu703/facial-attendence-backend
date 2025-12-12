@@ -125,10 +125,21 @@ class DailyConsolidationService {
           const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
           shiftEndTime = buildShiftEndTime(inTime, shift);
           
-          // Calculate delay
-          if (inTime.getTime() > shiftStartTime.getTime()) {
-            delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
-          }
+        // Calculate delay: Check-in time - Shift start time
+        // Consider grace_before: if check-in is within grace period before shift start, delay = 0
+        const graceBeforeMinutes = shift.graceBefore || 0;
+        const graceStartTime = new Date(shiftStartTime.getTime() - graceBeforeMinutes * 60 * 1000);
+        
+        if (inTime.getTime() < graceStartTime.getTime()) {
+          // Check-in is before grace period - no delay (early arrival)
+          delayByMinutes = 0;
+        } else if (inTime.getTime() > shiftStartTime.getTime()) {
+          // Check-in is after shift start - calculate delay
+          delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
+        } else {
+          // Check-in is within grace period or exactly on time - no delay
+          delayByMinutes = 0;
+        }
           
           // Determine status: Missing Punch if shift ended, otherwise show as present but incomplete
           const now = new Date();
@@ -200,8 +211,19 @@ class DailyConsolidationService {
 
         // Calculate delay based on shift start time
         // Delay = Check-in time - Shift start time (if check-in is after shift start)
-        if (inTime.getTime() > shiftStartTime.getTime()) {
+        // Consider grace_before: if check-in is within grace period before shift start, delay = 0
+        const graceBeforeMinutes = shift.graceBefore || 0;
+        const graceStartTime = new Date(shiftStartTime.getTime() - graceBeforeMinutes * 60 * 1000);
+        
+        if (inTime.getTime() < graceStartTime.getTime()) {
+          // Check-in is before grace period - no delay (early arrival)
+          delayByMinutes = 0;
+        } else if (inTime.getTime() > shiftStartTime.getTime()) {
+          // Check-in is after shift start - calculate delay
           delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
+        } else {
+          // Check-in is within grace period or exactly on time - no delay
+          delayByMinutes = 0;
         }
 
         // Calculate extra time based on shift end time

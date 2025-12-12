@@ -91,7 +91,8 @@ class DailyConsolidationService {
           };
         }
         
-        // Employee has check-in but no checkout - calculate partial hours
+        // Employee has check-in but no checkout
+        // Rule: If checkout is missing, total hours = 0 (will be calculated after daily closing job)
         const firstCheckIn = records.find(r => r.in_time)?.in_time;
         if (!firstCheckIn) {
           return {
@@ -113,12 +114,10 @@ class DailyConsolidationService {
         const employeeType = records[0].employee_type;
         const shifts = await getAllShifts(employeeType);
         
-        // Calculate delay
+        // Calculate delay only
         let delayByMinutes = 0;
         let shiftEndTime = null;
-        let currentTime = new Date();
-        let partialHours = 0;
-        let status = 'Short';
+        let status = 'Missing Punch'; // Default: checkout missing
         
         if (shifts.length > 0) {
           const detectedShift = detectShiftForTime(inTime, shifts);
@@ -131,41 +130,14 @@ class DailyConsolidationService {
             delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
           }
           
-          // Calculate partial hours: from check-in to now (or shift end, whichever is earlier)
-          // This gives us hours worked so far
-          const endTimeForCalculation = currentTime.getTime() < shiftEndTime.getTime() 
-            ? currentTime 
-            : shiftEndTime;
-          
-          partialHours = Math.max(0, (endTimeForCalculation.getTime() - inTime.getTime()) / (1000 * 60 * 60));
-          partialHours = Math.min(partialHours, this.config.MAX_DAY_DURATION_HOURS);
-          
-          // Determine status based on partial hours
-          if (partialHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
-            status = 'Full Day';
-          } else if (partialHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
-            status = 'Half Day';
-          } else if (partialHours > 0) {
-            status = 'Short';
-          }
-          
-          // Only mark as "Missing Punch" if shift has ended and they forgot checkout
+          // Determine status: Missing Punch if shift ended, otherwise show as present but incomplete
           const now = new Date();
           if (now.getTime() > shiftEndTime.getTime()) {
             // Shift has ended - they forgot to checkout
             status = 'Missing Punch';
-          }
-        } else {
-          // No shift settings - calculate from check-in to now
-          partialHours = Math.max(0, (currentTime.getTime() - inTime.getTime()) / (1000 * 60 * 60));
-          partialHours = Math.min(partialHours, this.config.MAX_DAY_DURATION_HOURS);
-          
-          if (partialHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
-            status = 'Full Day';
-          } else if (partialHours >= this.config.HALF_DAY_THRESHOLD_HOURS) {
-            status = 'Half Day';
-          } else if (partialHours > 0) {
-            status = 'Short';
+          } else {
+            // Shift still running - show as present but incomplete
+            status = 'Present (Incomplete)';
           }
         }
         
@@ -174,12 +146,12 @@ class DailyConsolidationService {
           attendance_date: date,
           effective_in_time: firstCheckIn,
           effective_out_time: null,
-          total_work_hours: parseFloat(partialHours.toFixed(2)),
+          total_work_hours: 0, // No checkout = 0 hours (will be calculated after daily closing)
           delay_by_minutes: delayByMinutes,
           extra_time_minutes: 0,
           ot_hours_decimal: 0,
           status: status,
-          missing_punch: hasIncompleteSession && shiftEndTime && new Date().getTime() > shiftEndTime.getTime(),
+          missing_punch: hasIncompleteSession,
           valid_sessions_count: 0
         };
       }
@@ -263,6 +235,7 @@ class DailyConsolidationService {
       }
 
       // Determine status based on total work hours
+      // Note: If checkout is missing, totalWorkHours will be 0 (from incomplete sessions)
       let status = 'Absent';
       if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
         status = 'Full Day';
@@ -271,24 +244,8 @@ class DailyConsolidationService {
       } else if (totalWorkHours > 0) {
         status = 'Short';
       } else if (effectiveInTime && !effectiveOutTime) {
-        // Has check-in but no checkout - check if shift ended
-        const employeeType = validSessions[0]?.employee_type || records[0]?.employee_type;
-        const shifts = await getAllShifts(employeeType);
-        if (shifts.length > 0) {
-          const inTime = new Date(effectiveInTime);
-          const detectedShift = detectShiftForTime(inTime, shifts);
-          const shift = detectedShift?.shift || shifts[0];
-          const shiftEndTime = buildShiftEndTime(inTime, shift);
-          const now = new Date();
-          
-          if (now.getTime() > shiftEndTime.getTime()) {
-            status = 'Missing Punch'; // Shift ended, forgot checkout
-          } else {
-            status = 'Short'; // Still working, show partial status
-          }
-        } else {
-          status = 'Short'; // No shift settings, show partial
-        }
+        // Has check-in but no checkout - Missing Punch
+        status = 'Missing Punch';
       }
 
       return {

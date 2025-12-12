@@ -264,19 +264,70 @@ router.put('/by-keys/update', protect, async (req, res) => {
   }
 
   try {
-    const lookupRes = await db.query(
+    const empRes = await db.query(
+      `SELECT employee_id FROM employee_details WHERE employee_code = $1`,
+      [employee_code]
+    );
+
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Employee not found with given employee_code.' });
+    }
+
+    const employeeId = empRes.rows[0].employee_id;
+
+    // Try to find record by exact in_time match first
+    let lookupRes = await db.query(
       `SELECT ar.attendance_id, ar.attendance_date, ar.in_time, ar.out_time,
               ar.location_in, ar.location_out, e.employee_type
        FROM attendance_records ar
        JOIN employee_details e ON e.employee_id = ar.employee_id
-       WHERE e.employee_code = $1
+       WHERE ar.employee_id = $1
          AND ar.attendance_date = $2
-         AND ar.in_time = $3`,
-      [employee_code, attendance_date, in_time]
+         AND ar.in_time::timestamp = $3::timestamp`,
+      [employeeId, attendance_date, in_time]
     );
 
+    // If exact match not found, try to find by date range (within 1 minute tolerance)
     if (lookupRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Attendance record not found for given keys.' });
+      const inTimeDate = new Date(in_time);
+      const toleranceStart = new Date(inTimeDate.getTime() - 60 * 1000); // 1 minute before
+      const toleranceEnd = new Date(inTimeDate.getTime() + 60 * 1000); // 1 minute after
+
+      lookupRes = await db.query(
+        `SELECT ar.attendance_id, ar.attendance_date, ar.in_time, ar.out_time,
+                ar.location_in, ar.location_out, e.employee_type
+         FROM attendance_records ar
+         JOIN employee_details e ON e.employee_id = ar.employee_id
+         WHERE ar.employee_id = $1
+           AND ar.attendance_date = $2
+           AND ar.in_time >= $3::timestamp
+           AND ar.in_time <= $4::timestamp
+         ORDER BY ar.in_time ASC
+         LIMIT 1`,
+        [employeeId, attendance_date, toleranceStart.toISOString(), toleranceEnd.toISOString()]
+      );
+    }
+
+    // If still not found, get the first record for that date (for backward compatibility)
+    if (lookupRes.rows.length === 0) {
+      lookupRes = await db.query(
+        `SELECT ar.attendance_id, ar.attendance_date, ar.in_time, ar.out_time,
+                ar.location_in, ar.location_out, e.employee_type
+         FROM attendance_records ar
+         JOIN employee_details e ON e.employee_id = ar.employee_id
+         WHERE ar.employee_id = $1
+           AND ar.attendance_date = $2
+         ORDER BY ar.in_time ASC
+         LIMIT 1`,
+        [employeeId, attendance_date]
+      );
+    }
+
+    if (lookupRes.rows.length === 0) {
+      return res.status(404).json({ 
+        message: 'Attendance record not found for given keys.',
+        details: `No record found for employee_code: ${employee_code}, date: ${attendance_date}`
+      });
     }
 
     const existing = lookupRes.rows[0];
@@ -326,18 +377,64 @@ router.delete('/by-keys/delete', protect, async (req, res) => {
   }
 
   try {
-    const deleteRes = await db.query(
-      `DELETE FROM attendance_records
-       USING employee_details
-       WHERE attendance_records.employee_id = employee_details.employee_id
-         AND employee_details.employee_code = $1
-         AND attendance_records.attendance_date = $2
-         AND attendance_records.in_time = $3`,
-      [employee_code, attendance_date, in_time]
+    // First, get employee_id from employee_code
+    const empRes = await db.query(
+      `SELECT employee_id FROM employee_details WHERE employee_code = $1`,
+      [employee_code]
     );
 
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Employee not found with given employee_code.' });
+    }
+
+    const employeeId = empRes.rows[0].employee_id;
+
+    // Try exact match first
+    let deleteRes = await db.query(
+      `DELETE FROM attendance_records
+       WHERE employee_id = $1
+         AND attendance_date = $2
+         AND in_time::timestamp = $3::timestamp`,
+      [employeeId, attendance_date, in_time]
+    );
+
+    // If exact match not found, try with tolerance
+    if (deleteRes.rowCount === 0 && in_time) {
+      const inTimeDate = new Date(in_time);
+      const toleranceStart = new Date(inTimeDate.getTime() - 60 * 1000);
+      const toleranceEnd = new Date(inTimeDate.getTime() + 60 * 1000);
+
+      deleteRes = await db.query(
+        `DELETE FROM attendance_records
+         WHERE employee_id = $1
+           AND attendance_date = $2
+           AND in_time >= $3::timestamp
+           AND in_time <= $4::timestamp
+         LIMIT 1`,
+        [employeeId, attendance_date, toleranceStart.toISOString(), toleranceEnd.toISOString()]
+      );
+    }
+
+    // If still not found, delete first record for that date
     if (deleteRes.rowCount === 0) {
-      return res.status(404).json({ message: 'Attendance record not found for given keys.' });
+      deleteRes = await db.query(
+        `DELETE FROM attendance_records
+         WHERE employee_id = $1
+           AND attendance_date = $2
+         AND attendance_id = (
+           SELECT attendance_id FROM attendance_records
+           WHERE employee_id = $1 AND attendance_date = $2
+           ORDER BY in_time ASC LIMIT 1
+         )`,
+        [employeeId, attendance_date]
+      );
+    }
+
+    if (deleteRes.rowCount === 0) {
+      return res.status(404).json({ 
+        message: 'Attendance record not found for given keys.',
+        details: `No record found for employee_code: ${employee_code}, date: ${attendance_date}`
+      });
     }
 
     return res.json({ message: 'Attendance record deleted successfully (by keys).' });

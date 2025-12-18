@@ -92,7 +92,7 @@ class DailyConsolidationService {
         }
         
         // Employee has check-in but no checkout
-        // Rule: Mark as "Absent" and keep checkout as null (Not checked out)
+        // Rule: Determine status based on shift status
         const firstCheckIn = records.find(r => r.in_time)?.in_time;
         if (!firstCheckIn) {
           return {
@@ -114,12 +114,15 @@ class DailyConsolidationService {
         const employeeType = records[0].employee_type;
         const shifts = await getAllShifts(employeeType);
         
-        // Calculate delay only
+        // Calculate delay and determine status
         let delayByMinutes = 0;
+        let status = 'Missing Punch'; // Default if shift ended
+        let missingPunch = true;
         
         if (shifts.length > 0) {
           const detectedShift = detectShiftForTime(inTime, shifts);
           const shift = detectedShift?.shift || shifts[0];
+          const shiftEndTime = buildShiftEndTime(inTime, shift);
           
           // Build shift start time on the same date as check-in
           const checkInDate = new Date(inTime);
@@ -129,20 +132,35 @@ class DailyConsolidationService {
           shiftStartOnDate.setHours(shift.startHour, shift.startMinute, 0, 0);
           
           // Calculate delay: shiftStartTime - checkInTime (no negative values)
-          // If check-in is before shift start, delay = 0
+          // If check-in is after shift start, delay = checkInTime - shiftStartTime
           const inTimeMs = inTime.getTime();
           const shiftStartMs = shiftStartOnDate.getTime();
           
           if (inTimeMs > shiftStartMs) {
-            // Check-in is after shift start - calculate delay
+            // Check-in is after shift start - calculate delay (late arrival)
             delayByMinutes = Math.max(0, Math.round((inTimeMs - shiftStartMs) / (1000 * 60)));
           } else {
             // Check-in is before or on time - no delay
             delayByMinutes = 0;
           }
+          
+          // Determine status based on shift status + grace period
+          // Missing Punch only after shift end + grace period has passed
+          const graceAfterMinutes = shift.graceAfter || 0;
+          const shiftEndWithGrace = new Date(shiftEndTime.getTime() + graceAfterMinutes * 60 * 1000);
+          const now = new Date();
+          
+          if (now.getTime() <= shiftEndWithGrace.getTime()) {
+            // Shift is still running or within grace period - mark as Present
+            status = 'Present';
+            missingPunch = false; // Not missing punch yet, shift still running or in grace period
+          } else {
+            // Shift has ended and grace period has passed - mark as Missing Punch
+            status = 'Missing Punch';
+            missingPunch = true;
+          }
         }
         
-        // Mark as Absent when checkout is missing
         return {
           employee_id: employeeId,
           attendance_date: date,
@@ -152,8 +170,8 @@ class DailyConsolidationService {
           delay_by_minutes: delayByMinutes,
           extra_time_minutes: 0,
           ot_hours_decimal: 0,
-          status: 'Absent', // Mark as Absent when checkout is missing
-          missing_punch: true,
+          status: status, // Present if shift running, Missing Punch if shift ended
+          missing_punch: missingPunch,
           valid_sessions_count: 0
         };
       }

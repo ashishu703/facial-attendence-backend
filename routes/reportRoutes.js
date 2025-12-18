@@ -14,58 +14,82 @@ router.get('/organization-stats', protect, async (req, res) => {
     // Ensure is_active column exists
     await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
     
-    const { rows } = await db.query(
-      `WITH org_stats AS (
-        SELECT 
-          o.organization_id,
-          o.organization_name,
-          COUNT(DISTINCT e.employee_id) as total_employees,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 THEN ar.employee_id END) as present_today,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND ar.delay_by_minutes > 0 THEN ar.employee_id END) as late_arrivals,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND ar.out_time IS NULL THEN ar.employee_id END) as not_checked_out,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND EXISTS (
-            SELECT 1 FROM attendance_records ar2 
-            WHERE ar2.employee_id = ar.employee_id 
-            AND ar2.attendance_date = $1 
-            AND ar2.out_time IS NOT NULL
-          ) THEN ar.employee_id END) as early_departures
-        FROM organizations o
-        LEFT JOIN employee_details e ON e.organization_id = o.organization_id AND COALESCE(e.is_active, true) = true
-        LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id
-        GROUP BY o.organization_id, o.organization_name
-      ),
-      -- Employees counted as OT only if they actually have OT hours recorded
-      ot_stats AS (
-        SELECT 
-          e.organization_id,
-          COUNT(DISTINCT e.employee_id) as ot_employees
-        FROM employee_details e
-        JOIN attendance_records ar ON ar.employee_id = e.employee_id
-        WHERE ar.attendance_date = $1
-          AND COALESCE(ar.ot_hours_decimal, 0) > 0
-          AND COALESCE(e.is_active, true) = true
-        GROUP BY e.organization_id
-      )
-      SELECT 
-        os.organization_id,
-        os.organization_name,
-        os.total_employees,
-        os.present_today,
-        COALESCE(os.total_employees - os.present_today, 0) as on_leave_today,
-        os.late_arrivals,
-        os.early_departures,
-        COALESCE(ots.ot_employees, 0) as ot_employees,
-        CASE 
-          WHEN os.total_employees > 0 THEN (os.present_today::float / os.total_employees::float * 100)
-          ELSE 0 
-        END as attendance_percentage
-      FROM org_stats os
-      LEFT JOIN ot_stats ots ON ots.organization_id = os.organization_id
-      ORDER BY os.organization_name`,
-      [today]
+    // Get all active employees with their organizations
+    const { rows: employees } = await db.query(
+      `SELECT e.employee_id, e.employee_type, e.organization_id, o.organization_name
+       FROM employee_details e
+       LEFT JOIN organizations o ON o.organization_id = e.organization_id
+       WHERE COALESCE(e.is_active, true) = true`
     );
     
-    res.json(rows);
+    // Consolidate attendance for each employee
+    const consolidatedData = await Promise.all(
+      employees.map(async (emp) => {
+        const consolidated = await consolidateEmployeeDate(emp.employee_id, today);
+        return {
+          organization_id: emp.organization_id,
+          organization_name: emp.organization_name || '',
+          employee_id: emp.employee_id,
+          status: consolidated.status,
+          delay_by_minutes: consolidated.delay_by_minutes,
+          ot_hours_decimal: consolidated.ot_hours_decimal,
+          effective_in_time: consolidated.effective_in_time
+        };
+      })
+    );
+    
+    // Group by organization and calculate stats
+    const orgMap = new Map();
+    
+    consolidatedData.forEach((data) => {
+      const orgId = data.organization_id;
+      if (!orgMap.has(orgId)) {
+        orgMap.set(orgId, {
+          organization_id: orgId,
+          organization_name: data.organization_name,
+          total_employees: 0,
+          present_today: 0,
+          late_arrivals: 0,
+          not_checked_out: 0,
+          early_departures: 0,
+          ot_employees: 0
+        });
+      }
+      
+      const org = orgMap.get(orgId);
+      org.total_employees++;
+      
+      // Present: Has check-in (status is not "Absent" or has effective_in_time)
+      if (data.effective_in_time || (data.status !== 'Absent' && data.status !== null)) {
+        org.present_today++;
+      }
+      
+      // Late arrivals: Checked in after shift start time (delay > 0)
+      if (data.delay_by_minutes > 0) {
+        org.late_arrivals++;
+      }
+      
+      // Not checked out: Has check-in but no checkout
+      if (data.effective_in_time && !data.effective_out_time) {
+        org.not_checked_out++;
+      }
+      
+      // OT employees: Has OT hours
+      if (data.ot_hours_decimal > 0) {
+        org.ot_employees++;
+      }
+    });
+    
+    // Convert to array and calculate percentages
+    const results = Array.from(orgMap.values()).map(org => ({
+      ...org,
+      on_leave_today: Math.max(0, org.total_employees - org.present_today),
+      attendance_percentage: org.total_employees > 0 
+        ? parseFloat((org.present_today / org.total_employees * 100).toFixed(2))
+        : 0
+    }));
+    
+    res.json(results);
   } catch (error) {
     console.error('Error fetching organization stats:', error);
     res.status(500).json({ message: 'Failed to fetch organization statistics' });
@@ -77,65 +101,86 @@ router.get('/organizations/summary', protect, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     
+    // Use the same logic as organization-stats
     // Ensure is_active column exists
     await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
     
-    const { rows } = await db.query(
-      `WITH org_stats AS (
-        SELECT 
-          o.organization_id,
-          o.organization_name,
-          COUNT(DISTINCT e.employee_id) as total_employees,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 THEN ar.employee_id END) as present_today,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND ar.delay_by_minutes > 0 THEN ar.employee_id END) as late_arrivals,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND ar.out_time IS NULL THEN ar.employee_id END) as not_checked_out,
-          COUNT(DISTINCT CASE WHEN ar.attendance_date = $1 AND EXISTS (
-            SELECT 1 FROM attendance_records ar2 
-            WHERE ar2.employee_id = ar.employee_id 
-            AND ar2.attendance_date = $1 
-            AND ar2.out_time IS NOT NULL
-          ) THEN ar.employee_id END) as early_departures
-        FROM organizations o
-        LEFT JOIN employee_details e ON e.organization_id = o.organization_id AND COALESCE(e.is_active, true) = true
-        LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id
-        GROUP BY o.organization_id, o.organization_name
-      ),
-      ot_stats AS (
-        SELECT 
-          e.organization_id,
-          COUNT(DISTINCT e.employee_id) as ot_employees
-        FROM employee_details e
-        JOIN attendance_records ar ON ar.employee_id = e.employee_id
-        WHERE ar.attendance_date = $1
-          AND COALESCE(e.is_active, true) = true
-        AND (
-          SELECT COUNT(*) FROM attendance_records ar2 
-          WHERE ar2.employee_id = e.employee_id 
-          AND ar2.attendance_date = $1 
-          AND ar2.out_time IS NOT NULL
-        ) > 0
-        GROUP BY e.organization_id
-      )
-      SELECT 
-        os.organization_id,
-        os.organization_name,
-        os.total_employees,
-        os.present_today,
-        COALESCE(os.total_employees - os.present_today, 0) as on_leave_today,
-        os.late_arrivals,
-        os.early_departures,
-        COALESCE(ots.ot_employees, 0) as ot_employees,
-        CASE 
-          WHEN os.total_employees > 0 THEN (os.present_today::float / os.total_employees::float * 100)
-          ELSE 0 
-        END as attendance_percentage
-      FROM org_stats os
-      LEFT JOIN ot_stats ots ON ots.organization_id = os.organization_id
-      ORDER BY os.organization_name`,
-      [today]
+    // Get all active employees with their organizations
+    const { rows: employees } = await db.query(
+      `SELECT e.employee_id, e.employee_type, e.organization_id, o.organization_name
+       FROM employee_details e
+       LEFT JOIN organizations o ON o.organization_id = e.organization_id
+       WHERE COALESCE(e.is_active, true) = true`
     );
     
-    res.json(rows);
+    // Consolidate attendance for each employee
+    const consolidatedData = await Promise.all(
+      employees.map(async (emp) => {
+        const consolidated = await consolidateEmployeeDate(emp.employee_id, today);
+        return {
+          organization_id: emp.organization_id,
+          organization_name: emp.organization_name || '',
+          employee_id: emp.employee_id,
+          status: consolidated.status,
+          delay_by_minutes: consolidated.delay_by_minutes,
+          ot_hours_decimal: consolidated.ot_hours_decimal,
+          effective_in_time: consolidated.effective_in_time
+        };
+      })
+    );
+    
+    // Group by organization and calculate stats
+    const orgMap = new Map();
+    
+    consolidatedData.forEach((data) => {
+      const orgId = data.organization_id;
+      if (!orgMap.has(orgId)) {
+        orgMap.set(orgId, {
+          organization_id: orgId,
+          organization_name: data.organization_name,
+          total_employees: 0,
+          present_today: 0,
+          late_arrivals: 0,
+          not_checked_out: 0,
+          early_departures: 0,
+          ot_employees: 0
+        });
+      }
+      
+      const org = orgMap.get(orgId);
+      org.total_employees++;
+      
+      // Present: Has check-in (status is not "Absent" or has effective_in_time)
+      if (data.effective_in_time || (data.status !== 'Absent' && data.status !== null)) {
+        org.present_today++;
+      }
+      
+      // Late arrivals: Checked in after shift start time (delay > 0)
+      if (data.delay_by_minutes > 0) {
+        org.late_arrivals++;
+      }
+      
+      // Not checked out: Has check-in but no checkout
+      if (data.effective_in_time && !data.effective_out_time) {
+        org.not_checked_out++;
+      }
+      
+      // OT employees: Has OT hours
+      if (data.ot_hours_decimal > 0) {
+        org.ot_employees++;
+      }
+    });
+    
+    // Convert to array and calculate percentages
+    const results = Array.from(orgMap.values()).map(org => ({
+      ...org,
+      on_leave_today: Math.max(0, org.total_employees - org.present_today),
+      attendance_percentage: org.total_employees > 0 
+        ? parseFloat((org.present_today / org.total_employees * 100).toFixed(2))
+        : 0
+    }));
+    
+    res.json(results);
   } catch (error) {
     console.error('Error fetching organization summary:', error);
     res.status(500).json({ message: 'Failed to fetch organization summary' });
@@ -304,6 +349,12 @@ router.get('/detailed-report', protect, async (req, res) => {
         const consolidated = await consolidateEmployeeDate(employee.employee_id, date);
         
         // Add employee details
+        // If employee has check-in but no checkout, mark as Absent in report
+        let reportStatus = consolidated.status;
+        if (consolidated.effective_in_time && !consolidated.effective_out_time) {
+          reportStatus = 'Absent'; // Mark as Absent if check-in but no checkout
+        }
+        
         const result = {
           employee_id: employee.employee_id,
           employee_code: employee.employee_code || employee.employee_id,
@@ -312,12 +363,12 @@ router.get('/detailed-report', protect, async (req, res) => {
           organization_name: employee.organization_name || '',
           attendance_date: date,
           in_time: consolidated.effective_in_time,
-          out_time: consolidated.effective_out_time,
+          out_time: consolidated.effective_out_time, // Will be null if no checkout (shows as N/A in frontend)
           delay_by_minutes: consolidated.delay_by_minutes,
           extra_time_minutes: consolidated.extra_time_minutes,
           total_working_hours_decimal: consolidated.total_work_hours,
           ot_hours_decimal: consolidated.ot_hours_decimal,
-          status: consolidated.status, // Full Day / Half Day / Short / Absent
+          status: reportStatus, // Absent if check-in but no checkout
           missing_punch: consolidated.missing_punch,
           is_ot: consolidated.ot_hours_decimal > 0,
           shift_name: null, // Will be set below

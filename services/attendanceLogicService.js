@@ -224,9 +224,9 @@ class AttendanceLogicService {
     let ot_hours_decimal = 0;
     const otStartThreshold = new Date(shiftEndTime.getTime() + (shift.graceAfter || 0) * 60 * 1000);
     if (outTime.getTime() > otStartThreshold.getTime()) {
-      const otMinutesFromEnd = Math.round((outTime.getTime() - shiftEndTime.getTime()) / (1000 * 60));
-      if (otMinutesFromEnd >= this.MIN_OT_MINUTES) {
-        ot_hours_decimal = parseFloat((otMinutesFromEnd / 60).toFixed(2));
+      const otMinutesFromThreshold = Math.round((outTime.getTime() - otStartThreshold.getTime()) / (1000 * 60));
+      if (otMinutesFromThreshold >= this.MIN_OT_MINUTES) {
+        ot_hours_decimal = parseFloat((otMinutesFromThreshold / 60).toFixed(2));
       }
     }
 

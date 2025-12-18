@@ -11,6 +11,9 @@ router.get('/organization-stats', protect, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     
+    // Ensure is_active column exists
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+    
     const { rows } = await db.query(
       `WITH org_stats AS (
         SELECT 
@@ -27,7 +30,7 @@ router.get('/organization-stats', protect, async (req, res) => {
             AND ar2.out_time IS NOT NULL
           ) THEN ar.employee_id END) as early_departures
         FROM organizations o
-        LEFT JOIN employee_details e ON e.organization_id = o.organization_id
+        LEFT JOIN employee_details e ON e.organization_id = o.organization_id AND COALESCE(e.is_active, true) = true
         LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id
         GROUP BY o.organization_id, o.organization_name
       ),
@@ -40,6 +43,7 @@ router.get('/organization-stats', protect, async (req, res) => {
         JOIN attendance_records ar ON ar.employee_id = e.employee_id
         WHERE ar.attendance_date = $1
           AND COALESCE(ar.ot_hours_decimal, 0) > 0
+          AND COALESCE(e.is_active, true) = true
         GROUP BY e.organization_id
       )
       SELECT 
@@ -73,6 +77,9 @@ router.get('/organizations/summary', protect, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     
+    // Ensure is_active column exists
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+    
     const { rows } = await db.query(
       `WITH org_stats AS (
         SELECT 
@@ -89,7 +96,7 @@ router.get('/organizations/summary', protect, async (req, res) => {
             AND ar2.out_time IS NOT NULL
           ) THEN ar.employee_id END) as early_departures
         FROM organizations o
-        LEFT JOIN employee_details e ON e.organization_id = o.organization_id
+        LEFT JOIN employee_details e ON e.organization_id = o.organization_id AND COALESCE(e.is_active, true) = true
         LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id
         GROUP BY o.organization_id, o.organization_name
       ),
@@ -100,6 +107,7 @@ router.get('/organizations/summary', protect, async (req, res) => {
         FROM employee_details e
         JOIN attendance_records ar ON ar.employee_id = e.employee_id
         WHERE ar.attendance_date = $1
+          AND COALESCE(e.is_active, true) = true
         AND (
           SELECT COUNT(*) FROM attendance_records ar2 
           WHERE ar2.employee_id = e.employee_id 
@@ -140,11 +148,15 @@ router.get('/employee-attendance', protect, async (req, res) => {
     const { date } = req.query;
     const targetDate = date || new Date().toISOString().split('T')[0];
     
+    // Ensure is_active column exists
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+    
     const { rows: employees } = await db.query(
       `SELECT e.employee_id, e.employee_code, e.employee_name, 
               e.employee_type, e.organization_id, o.organization_name
        FROM employee_details e
        LEFT JOIN organizations o ON o.organization_id = e.organization_id
+       WHERE COALESCE(e.is_active, true) = true
        ORDER BY o.organization_name, e.employee_name`
     );
 
@@ -210,6 +222,7 @@ router.get('/attendance-trend', protect, async (req, res) => {
         FROM date_series ds
         CROSS JOIN employee_details e
         LEFT JOIN attendance_records ar ON ar.employee_id = e.employee_id AND ar.attendance_date = ds.date
+        WHERE COALESCE(e.is_active, true) = true
         GROUP BY ds.date
       )
       SELECT 
@@ -246,13 +259,16 @@ router.get('/detailed-report', protect, async (req, res) => {
       dates.push(d.toISOString().split('T')[0]);
     }
 
+    // Ensure is_active column exists
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+    
     // Get all employees (including filters)
     let employeeQuery = `
       SELECT DISTINCT e.employee_id, e.employee_code, e.employee_name, 
              e.employee_type, e.organization_id, o.organization_name
       FROM employee_details e
       LEFT JOIN organizations o ON o.organization_id = e.organization_id
-      WHERE 1=1
+      WHERE COALESCE(e.is_active, true) = true
     `;
     const empParams = [];
     let empParamIndex = 1;

@@ -3,39 +3,27 @@ const { getAllShifts, detectShiftForTime, getShiftEndWithGrace } = require('./at
 const { calculateAttendanceMetrics } = require('./attendanceLogicService');
 
 class AutoCheckoutService {
+  /**
+   * Auto checkout service - DISABLED
+   * 
+   * NOTE: Changed behavior - No longer automatically sets checkout time.
+   * Employees who didn't check out will remain with null checkout time
+   * and will be marked as "Absent" by the consolidation service.
+   */
   async autoCheckoutOverdue() {
     try {
-      const { rows } = await db.query(`
-        SELECT r.attendance_id, r.employee_id, r.attendance_date, r.in_time::text AS in_time,
-               d.employee_type
-        FROM attendance_records r
-        JOIN employee_details d ON r.employee_id = d.employee_id
-        WHERE r.out_time IS NULL
-      `);
+      // Do NOT automatically set checkout time
+      // Leave checkout as null so consolidation service can mark as "Absent"
+      console.log(
+        `[AUTO-CHECKOUT] Auto checkout disabled. ` +
+        `Employees without checkout will be marked as "Not checked out" and "Absent" by consolidation service`
+      );
       
-      const now = new Date();
-      for (const row of rows) {
-        const inTime = new Date(row.in_time);
-        const shifts = await getAllShifts(row.employee_type);
-        if (!shifts.length) continue;
-        
-        const detected = detectShiftForTime(inTime, shifts);
-        const shift = detected?.shift || shifts[0];
-        const endWithGrace = getShiftEndWithGrace(inTime, shift);
-        
-        if (now.getTime() >= endWithGrace.getTime()) {
-          const outISO = endWithGrace.toISOString();
-          const metrics = await calculateAttendanceMetrics(row.in_time, outISO, row.employee_type, false);
-          await db.query(
-            `UPDATE attendance_records
-             SET out_time = $1::timestamp, delay_by_minutes=$2, extra_time_minutes=$3, total_working_hours_decimal=$4
-             WHERE attendance_id=$5`,
-            [outISO, metrics.delay_by_minutes, metrics.extra_time_minutes, metrics.total_working_hours_decimal, row.attendance_id]
-          );
-        }
-      }
+      // Return early without processing
+      return { processed: 0, reason: 'auto_checkout_disabled' };
     } catch (error) {
       console.error('autoCheckoutOverdue error:', error);
+      return { processed: 0, reason: 'error', error: error.message };
     }
   }
 }

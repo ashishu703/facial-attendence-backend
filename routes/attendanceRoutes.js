@@ -148,15 +148,20 @@ router.post('/mark', upload.single('image'), async (req, res) => {
 
     console.log(`[${requestId}] Step 2: Matching face with database...`);
     const embeddingString = `[${embedding.join(',')}]`;
+    // Ensure is_active column exists
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+
     const { rows } = await db.query(
-      `SELECT employee_id, employee_name, employee_type, face_embedding <-> $1::vector AS distance
-       FROM employee_details ORDER BY distance ASC LIMIT 1`,
+      `SELECT employee_id, employee_name, employee_type, COALESCE(is_active, true) as is_active, face_embedding <-> $1::vector AS distance
+       FROM employee_details 
+       WHERE COALESCE(is_active, true) = true
+       ORDER BY distance ASC LIMIT 1`,
       [embeddingString]
     );
 
     if (rows.length === 0) {
-      console.log(`[${requestId}] ❌ No employees found in database`);
-      return res.status(404).json({ message: 'No employees registered.' });
+      console.log(`[${requestId}] ❌ No active employees found in database`);
+      return res.status(404).json({ message: 'No active employees registered.' });
     }
 
     const bestMatch = rows[0];
@@ -171,6 +176,14 @@ router.post('/mark', upload.single('image'), async (req, res) => {
         message: 'Authentication failed. Face not recognized.',
         debug_distance: bestMatch.distance,
         threshold: FACE_MATCH_THRESHOLD
+      });
+    }
+    
+    // Check if employee is active
+    if (!bestMatch.is_active) {
+      console.log(`[${requestId}] ❌ Employee is inactive: ${bestMatch.employee_name}`);
+      return res.status(403).json({ 
+        message: 'Employee is inactive. Attendance cannot be marked.',
       });
     }
     
@@ -329,16 +342,20 @@ router.post('/mark', upload.single('image'), async (req, res) => {
 });
 
 async function fetchAttendanceRows(startDate, endDate) {
+  // Ensure is_active column exists
+  await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+  
   let query = `SELECT COALESCE(d.employee_code, d.employee_id::text) AS employee_code,
     d.employee_name, d.employee_type, r.attendance_date, r.in_time::text AS in_time,
     CASE WHEN r.out_time IS NOT NULL THEN r.out_time::text ELSE NULL END AS out_time,
     r.delay_by_minutes, r.extra_time_minutes, r.total_working_hours_decimal,
     r.location_in, r.location_out, r.attendance_id, r.employee_id
-    FROM attendance_records r JOIN employee_details d ON r.employee_id = d.employee_id`;
+    FROM attendance_records r JOIN employee_details d ON r.employee_id = d.employee_id
+    WHERE COALESCE(d.is_active, true) = true`;
   const params = [];
   if (startDate && endDate) {
     params.push(startDate, endDate);
-    query += ' WHERE r.attendance_date BETWEEN $1 AND $2';
+    query += ' AND r.attendance_date BETWEEN $1 AND $2';
   }
   query += ' ORDER BY r.attendance_date DESC, d.employee_name, r.in_time ASC';
   const { rows } = await db.query(query, params);

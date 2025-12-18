@@ -36,9 +36,10 @@ router.get('/', protect, async (_req, res) => {
     // Ensure optional columns exist so SELECT doesn't fail on fresh DBs
     await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS employee_code TEXT;`);
     await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS aadhar_last4 TEXT;`);
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
 
     const { rows } = await db.query(`
-      SELECT employee_id, employee_name, department, position, email, phone_number, employee_type, aadhar_last4, employee_code
+      SELECT employee_id, employee_name, department, position, email, phone_number, employee_type, aadhar_last4, employee_code, COALESCE(is_active, true) as is_active
       FROM employee_details
       ORDER BY employee_name ASC
     `);
@@ -46,6 +47,35 @@ router.get('/', protect, async (_req, res) => {
   } catch (e) {
     console.error('List employees error:', e);
     res.status(500).json({ message: 'Failed to fetch employees' });
+  }
+});
+
+// Toggle employee active status - MUST be defined before /:id route
+router.patch('/:id/toggle-active', protect, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+    
+    const { rows } = await db.query(
+      `UPDATE employee_details
+       SET is_active = COALESCE(NOT is_active, true)
+       WHERE employee_id = $1
+       RETURNING employee_id, is_active`,
+      [id]
+    );
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+    
+    res.json({ 
+      employee_id: rows[0].employee_id, 
+      is_active: rows[0].is_active,
+      message: `Employee ${rows[0].is_active ? 'activated' : 'deactivated'} successfully` 
+    });
+  } catch (e) {
+    console.error('Toggle employee active status error:', e);
+    res.status(500).json({ message: 'Failed to toggle employee status' });
   }
 });
 

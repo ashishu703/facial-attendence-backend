@@ -16,8 +16,11 @@ class AbsentMarkingService {
         return;
       }
 
+      // Ensure is_active column exists
+      await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+      
       const { rows: employees } = await db.query(
-        'SELECT employee_id FROM employee_details WHERE employee_type = $1',
+        'SELECT employee_id FROM employee_details WHERE employee_type = $1 AND COALESCE(is_active, true) = true',
         [employeeType]
       );
 

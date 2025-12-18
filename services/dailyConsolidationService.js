@@ -92,7 +92,7 @@ class DailyConsolidationService {
         }
         
         // Employee has check-in but no checkout
-        // Rule: If checkout is missing, total hours = 0 (will be calculated after daily closing job)
+        // Rule: Mark as "Absent" and keep checkout as null (Not checked out)
         const firstCheckIn = records.find(r => r.in_time)?.in_time;
         if (!firstCheckIn) {
           return {
@@ -116,53 +116,44 @@ class DailyConsolidationService {
         
         // Calculate delay only
         let delayByMinutes = 0;
-        let shiftEndTime = null;
-        let status = 'Missing Punch'; // Default: checkout missing
         
         if (shifts.length > 0) {
           const detectedShift = detectShiftForTime(inTime, shifts);
           const shift = detectedShift?.shift || shifts[0];
-          const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
-          shiftEndTime = buildShiftEndTime(inTime, shift);
           
-        // Calculate delay: Check-in time - Shift start time
-        // Consider grace_before: if check-in is within grace period before shift start, delay = 0
-        const graceBeforeMinutes = shift.graceBefore || 0;
-        const graceStartTime = new Date(shiftStartTime.getTime() - graceBeforeMinutes * 60 * 1000);
-        
-        if (inTime.getTime() < graceStartTime.getTime()) {
-          // Check-in is before grace period - no delay (early arrival)
-          delayByMinutes = 0;
-        } else if (inTime.getTime() > shiftStartTime.getTime()) {
-          // Check-in is after shift start - calculate delay
-          delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
-        } else {
-          // Check-in is within grace period or exactly on time - no delay
-          delayByMinutes = 0;
-        }
+          // Build shift start time on the same date as check-in
+          const checkInDate = new Date(inTime);
+          checkInDate.setHours(0, 0, 0, 0);
           
-          // Determine status: Missing Punch if shift ended, otherwise show as present but incomplete
-          const now = new Date();
-          if (now.getTime() > shiftEndTime.getTime()) {
-            // Shift has ended - they forgot to checkout
-            status = 'Missing Punch';
+          const shiftStartOnDate = new Date(checkInDate);
+          shiftStartOnDate.setHours(shift.startHour, shift.startMinute, 0, 0);
+          
+          // Calculate delay: shiftStartTime - checkInTime (no negative values)
+          // If check-in is before shift start, delay = 0
+          const inTimeMs = inTime.getTime();
+          const shiftStartMs = shiftStartOnDate.getTime();
+          
+          if (inTimeMs > shiftStartMs) {
+            // Check-in is after shift start - calculate delay
+            delayByMinutes = Math.max(0, Math.round((inTimeMs - shiftStartMs) / (1000 * 60)));
           } else {
-            // Shift still running - show as present but incomplete
-            status = 'Present (Incomplete)';
+            // Check-in is before or on time - no delay
+            delayByMinutes = 0;
           }
         }
         
+        // Mark as Absent when checkout is missing
         return {
           employee_id: employeeId,
           attendance_date: date,
           effective_in_time: firstCheckIn,
-          effective_out_time: null,
-          total_work_hours: 0, // No checkout = 0 hours (will be calculated after daily closing)
+          effective_out_time: null, // Not checked out
+          total_work_hours: 0,
           delay_by_minutes: delayByMinutes,
           extra_time_minutes: 0,
           ot_hours_decimal: 0,
-          status: status,
-          missing_punch: hasIncompleteSession,
+          status: 'Absent', // Mark as Absent when checkout is missing
+          missing_punch: true,
           valid_sessions_count: 0
         };
       }
@@ -189,11 +180,9 @@ class DailyConsolidationService {
         this.config.MAX_DAY_DURATION_HOURS
       );
 
-      // Get effective IN/OUT times
-      const effectiveInTime = validSessions[0].in_time; // Earliest IN
-      const effectiveOutTime = validSessions[validSessions.length - 1].out_time; // Latest OUT
+      const effectiveInTime = validSessions[0].in_time; 
+      const effectiveOutTime = validSessions[validSessions.length - 1].out_time; 
 
-      // Calculate delay and extra time based on effective times and shift settings
       const employeeType = validSessions[0].employee_type;
       const shifts = await getAllShifts(employeeType);
       
@@ -206,30 +195,44 @@ class DailyConsolidationService {
         const detectedShift = detectShiftForTime(inTime, shifts);
         const shift = detectedShift?.shift || shifts[0];
 
+        // Build shift start time on the same date as check-in
         const shiftStartTime = buildLocalTime(inTime, shift.startHour, shift.startMinute);
         const shiftEndTime = buildShiftEndTime(inTime, shift);
 
-        // Calculate delay based on shift start time
-        // Delay = Check-in time - Shift start time (if check-in is after shift start)
-        // Consider grace_before: if check-in is within grace period before shift start, delay = 0
-        const graceBeforeMinutes = shift.graceBefore || 0;
-        const graceStartTime = new Date(shiftStartTime.getTime() - graceBeforeMinutes * 60 * 1000);
+        // Ensure both times are on the same date for accurate comparison
+        // Get the date part from check-in time
+        const checkInDate = new Date(inTime);
+        checkInDate.setHours(0, 0, 0, 0);
         
-        if (inTime.getTime() < graceStartTime.getTime()) {
-          // Check-in is before grace period - no delay (early arrival)
-          delayByMinutes = 0;
-        } else if (inTime.getTime() > shiftStartTime.getTime()) {
+        const shiftStartOnDate = new Date(checkInDate);
+        shiftStartOnDate.setHours(shift.startHour, shift.startMinute, 0, 0);
+        
+        // Calculate delay: shiftStartTime - checkInTime (no negative values)
+        // If check-in is before shift start, delay = 0
+        const inTimeMs = inTime.getTime();
+        const shiftStartMs = shiftStartOnDate.getTime();
+        
+        if (inTimeMs > shiftStartMs) {
           // Check-in is after shift start - calculate delay
-          delayByMinutes = Math.round((inTime.getTime() - shiftStartTime.getTime()) / (1000 * 60));
+          delayByMinutes = Math.max(0, Math.round((inTimeMs - shiftStartMs) / (1000 * 60)));
         } else {
-          // Check-in is within grace period or exactly on time - no delay
+          // Check-in is before or on time - no delay
           delayByMinutes = 0;
         }
 
-        // Calculate extra time based on shift end time
-        // Extra time = Check-out time - Shift end time (if check-out is after shift end)
-        if (outTime && outTime.getTime() > shiftEndTime.getTime()) {
-          extraTimeMinutes = Math.round((outTime.getTime() - shiftEndTime.getTime()) / (1000 * 60));
+        // Calculate extra time: shiftEndTime - checkOutTime (no negative values)
+        // If check-out is before shift end, extra time = 0
+        if (outTime) {
+          const outTimeMs = outTime.getTime();
+          const shiftEndMs = shiftEndTime.getTime();
+          
+          if (outTimeMs > shiftEndMs) {
+            // Check-out is after shift end - calculate extra time
+            extraTimeMinutes = Math.max(0, Math.round((outTimeMs - shiftEndMs) / (1000 * 60)));
+          } else {
+            // Check-out is before or on time - no extra time
+            extraTimeMinutes = 0;
+          }
         }
       }
 
@@ -257,7 +260,8 @@ class DailyConsolidationService {
       }
 
       // Determine status based on total work hours
-      // Note: If checkout is missing, totalWorkHours will be 0 (from incomplete sessions)
+      // Note: If there are valid sessions, effectiveOutTime will always be set
+      // If there are no valid sessions, we already returned "Absent" earlier
       let status = 'Absent';
       if (totalWorkHours >= this.config.FULL_DAY_THRESHOLD_HOURS) {
         status = 'Full Day';
@@ -265,10 +269,9 @@ class DailyConsolidationService {
         status = 'Half Day';
       } else if (totalWorkHours > 0) {
         status = 'Short';
-      } else if (effectiveInTime && !effectiveOutTime) {
-        // Has check-in but no checkout - Missing Punch
-        status = 'Missing Punch';
       }
+      // Note: If totalWorkHours is 0 and we have valid sessions, it means all sessions were invalid
+      // In that case, status remains 'Absent' which is correct
 
       return {
         employee_id: employeeId,
@@ -296,17 +299,21 @@ class DailyConsolidationService {
     try {
       console.log(`[CONSOLIDATION] Consolidating attendance for date: ${date}`);
 
+      // Ensure is_active column exists
+      await db.query(`ALTER TABLE employee_details ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;`);
+
       // Get all unique employees who have records on this date
       const { rows: employees } = await db.query(
-        `SELECT DISTINCT employee_id 
-         FROM attendance_records 
-         WHERE attendance_date = $1`,
+        `SELECT DISTINCT r.employee_id 
+         FROM attendance_records r
+         JOIN employee_details d ON r.employee_id = d.employee_id
+         WHERE r.attendance_date = $1 AND COALESCE(d.is_active, true) = true`,
         [date]
       );
 
-      // Also get all employees (to mark absent ones)
+      // Also get all active employees (to mark absent ones)
       const { rows: allEmployees } = await db.query(
-        `SELECT employee_id FROM employee_details`
+        `SELECT employee_id FROM employee_details WHERE COALESCE(is_active, true) = true`
       );
 
       const allEmployeeIds = new Set([
